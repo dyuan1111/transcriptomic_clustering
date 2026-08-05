@@ -37,7 +37,7 @@ def merge_clusters(
         chunk_size: Optional[int] = None,
         return_markers_df: Optional[bool] = False,
         n_jobs: Optional[int] = 1
-) -> Tuple[Dict[Any, np.ndarray], Any]:
+) -> Tuple[Dict[Any, np.ndarray], Set]:
     """
     Merge clusters based on size and differential gene expression score
 
@@ -124,7 +124,9 @@ def merge_clusters(
     # Merge remaining clusters by differential expression
     logger.info("Merging Clusters by DE")
     tic = time.perf_counter()
-    merge_clusters_by_de(cluster_assignments_merge,
+    # merge_clusters_by_de mutates cluster_assignments_merge in place AND returns the merged
+    # means/vars/present (rebuilt from its numpy-level updates) for downstream marker selection.
+    cl_means, cl_vars, present_cl_means = merge_clusters_by_de(cluster_assignments_merge,
                          cl_means,
                          cl_vars,
                          present_cl_means,
@@ -148,7 +150,9 @@ def merge_clusters(
             cluster_means=cl_means,
             cluster_variances=cl_vars,
             present_cluster_means=present_cl_means,
-            thresholds=thresholds,
+            # strip merge-loop-only controls; they are not DE-filter thresholds and would be
+            # forwarded to filter_gene_stats (which rejects unknown kwargs).
+            thresholds={k: v for k, v in thresholds.items() if k not in ('merge_mode', 'max_cl_size')},
             n_markers=n_markers,
             de_method=de_method,
             return_markers_df=return_markers_df,
@@ -310,14 +314,13 @@ def calculate_similarity(
     """
     source_means = cluster_means.loc[group_rows]
     destination_means = cluster_means.loc[group_cols]
-    _, n_vars = cluster_means.shape
 
-    if n_vars > 2:
-        similarity = cdist(source_means, destination_means, 'correlation')
-        similarity *= -1
-        similarity += 1
-    else:
-        similarity = cdist_normalized(source_means, destination_means)
+    # #4 (bigcat alignment): use EUCLIDEAN distance on the reduced-space cluster means, matching R
+    # scrattch.bigcat get_knn_pairs (method="Annoy.Euclidean", sim = 1 - dist/max(dist) == cdist_normalized).
+    # The stock code used correlation distance for >2 dims, which fed the merge a DIFFERENT candidate-pair
+    # set than R. Euclidean here matches R's nearest-cluster selection for both the DE-merge candidates
+    # and the small-cluster pre-merge. (Ordering is invariant to the global 1-dist/max normalization.)
+    similarity = cdist_normalized(source_means, destination_means)
 
     similarity_df = pd.DataFrame(
         similarity,
@@ -461,80 +464,151 @@ def merge_clusters_by_de(
     score_th = thresholds.pop('score_thresh')
     min_genes = thresholds.pop('min_genes')
     thresholds.pop('low_thresh')
+    # max_cl_size caps the cells/cluster used in the DE test (matching scrattch.bigcat max.cl.size).
+    # DISABLED by default (None) -> use ALL cells per cluster, matching R with max.cl.size=Inf.
+    # Set an integer in merge_clusters_kwargs.thresholds['max_cl_size'] to re-enable the cap.
+    max_cl_size = thresholds.pop('max_cl_size', None)
+    # merge_mode:
+    #   'aligned' (default) - R-faithful: re-examine ALL clusters' k-nearest each round, merge the single
+    #      lowest-score pair + extras only < score_th/2, recompute. Highest fidelity to scrattch.bigcat,
+    #      but slow (many rounds).
+    #   'fast' - previous behavior: after round 1 only re-examine merged-destination clusters' neighbors,
+    #      and merge EVERY non-conflicting candidate < score_th per round. Far fewer rounds -> much faster.
+    merge_mode = thresholds.pop('merge_mode', 'aligned')
 
+    # ---- numpy state for the wide (clusters x genes) mean/var/present matrices ----
+    # Per-merge updates on 17k-column DataFrames via .loc[row]= / .drop are pathologically slow: each
+    # assignment re-introspects every column's dtype (numpy.array construction dominated ~74% of merge
+    # runtime). Instead hold means/vars/present as numpy arrays with a label->row map, combine rows
+    # arithmetically in place, and rebuild small DataFrames only for the per-round DE call. Native dtype
+    # is preserved so results are bit-identical to the old .loc/.drop path. Reduced-space means
+    # (cluster_means_rd, ~32 cols) stay a DataFrame -- cheap, and merged with merge_cluster_means_vars.
+    genes = cluster_means.columns
+    labels = list(cluster_means.index)
+    means_np = np.array(cluster_means.values, copy=True)
+    vars_np = np.array(cluster_variances.values, copy=True)
+    present_np = np.array(present_cluster_means.values, copy=True)
+    row_of = {lab: i for i, lab in enumerate(labels)}   # label -> fixed row index (rows never move)
+    live = set(labels)                                  # labels still active (dead rows stay but unused)
+
+    # DE-score cache keyed by frozenset(pair) -> {'score', 'num'} (mirrors R merge_cl_big's `de.genes`
+    # cache: pairs are recomputed only when new; entries touching a merged cluster are invalidated).
+    de_cache: Dict[frozenset, Dict[str, float]] = {}
+    half_th = score_th / 2.0
     merged_cluster_dsts = None
     while len(cluster_assignments.keys()) > 1:
-        # Use updated cluster means in reduced space to get nearest neighbors for each cluster
-        # Steps 1-3
+        # 'aligned' re-examines the k nearest clusters of EVERY cluster each round (like R get_knn_pairs);
+        # 'fast' only re-examines merged-destination clusters' neighbors after round 1 (previous behavior).
+        scope = None if merge_mode == 'aligned' else merged_cluster_dsts
         logger.info(f"Getting {k} nearest clusters")
-        neighbor_pairs = get_k_nearest_clusters(cluster_means_rd, merged_cluster_dsts, k)
-        neighbor_pairs = order_pairs(neighbor_pairs)
+        neighbor_pairs = order_pairs(get_k_nearest_clusters(cluster_means_rd, scope, k))
+        # dedupe to unique unordered pairs
+        seen = set(); uniq_pairs = []
+        for p in neighbor_pairs:
+            key = frozenset(p)
+            if key not in seen and len(key) == 2:
+                seen.add(key); uniq_pairs.append(p)
+        neighbor_pairs = uniq_pairs
         logger.info(f"Completed {k} nearest clusters")
         if len(neighbor_pairs) == 0:
             break
 
-        # Step 4: Get DE for pairs based on de_method
-        logger.info(f"Calculating de scores using {de_method}")
-        if de_method == 'ebayes':
-            scores = tc.de_pairs_ebayes(
-                neighbor_pairs,
-                cluster_means,
-                cluster_variances,
-                present_cluster_means,
-                cl_size,
-                thresholds,
-            )
-        elif de_method == 'chisq':
-            scores = tc.de_pairs_chisq(
-                neighbor_pairs,
-                cluster_means,
-                present_cluster_means,
-                cl_size,
-                thresholds,
-            )
-        else:
-            raise ValueError(f'Unknown de_method {de_method}, must be one of [chisq, ebayes]')
+        # Step 4: compute DE only for pairs not already cached (matching R's `new.pairs`)
+        to_compute = [p for p in neighbor_pairs if frozenset(p) not in de_cache]
+        if to_compute:
+            logger.info(f"Calculating de scores for {len(to_compute)} new pairs using {de_method}")
+            # per-cluster cell counts for the DE test; if max_cl_size is None the cap is DISABLED
+            # (use all cells), else cap at max_cl_size (recomputed each round so merged clusters re-cap)
+            cl_size_de = cl_size if max_cl_size is None else {c: min(n, max_cl_size) for c, n in cl_size.items()}
+            # rebuild small DataFrames of the LIVE clusters from the numpy state (single-block wrap, cheap;
+            # matches the old path which passed the full live-cluster means/vars/present each round)
+            live_labels = [lab for lab in labels if lab in live]
+            live_rows = [row_of[lab] for lab in live_labels]
+            means_df = pd.DataFrame(means_np[live_rows], index=live_labels, columns=genes, copy=False)
+            present_df = pd.DataFrame(present_np[live_rows], index=live_labels, columns=genes, copy=False)
+            if de_method == 'ebayes':
+                vars_df = pd.DataFrame(vars_np[live_rows], index=live_labels, columns=genes, copy=False)
+                new_scores = tc.de_pairs_ebayes(
+                    to_compute, means_df, vars_df,
+                    present_df, cl_size_de, thresholds,
+                )
+            elif de_method == 'chisq':
+                new_scores = tc.de_pairs_chisq(
+                    to_compute, means_df, present_df, cl_size_de, thresholds,
+                )
+            else:
+                raise ValueError(f'Unknown de_method {de_method}, must be one of [chisq, ebayes]')
+            for pr, row in new_scores.iterrows():
+                de_cache[frozenset(pr)] = {'score': float(row.score), 'num': float(row.num)}
 
-        # Sort scores
-        logger.info("Sorting DE Scores")
-        scores = scores.sort_values(by='score')
-
-        # Peek at first score and if > threshold, they are all greater than threshold
-        score = scores.iloc[0].score
-        if score >= score_th:
+        # Candidate pairs = R test_merge: score < score_th OR num < min_genes  (#3: strict <)
+        candidates = []
+        for p in neighbor_pairs:
+            d = de_cache[frozenset(p)]
+            if d['score'] < score_th or d['num'] < min_genes:
+                candidates.append((p, d['score']))
+        if len(candidates) == 0:
             break
+        candidates.sort(key=lambda x: x[1])   # ascending by score
 
-        # Merge pairs below threshold, skipping already merged clusters
+        # Merge acceptance:
+        #   'aligned': merge the single lowest-score pair unconditionally + extras only < score_th/2 (#1).
+        #   'fast':    merge EVERY non-conflicting candidate this round (previous behavior).
         merged_clusters = set()
         merged_cluster_dsts = set()
         logger.info("Merging clusters by DE score")
-        for pair, row in scores.iterrows():
-            score = row.score
-
-            # Merge if score < th or number of de genes < min)
-            if score >= score_th and row.num > min_genes:
-                break
-
+        for i, (pair, score) in enumerate(candidates):
             dst_label, src_label = pair
-
+            if merge_mode == 'aligned' and i != 0 and not (score < half_th):
+                continue
             if dst_label in merged_clusters or src_label in merged_clusters:
                 continue
 
             logger.debug(f"Merging cluster {src_label} into {dst_label} -- de score: {score}")
-
-            # Update cluster means on reduced space
+            # reduced-space means (small): keep the DataFrame path -- reads pre-merge sizes from
+            # cluster_assignments, so must run BEFORE the assignment update below.
             merge_cluster_means_vars(cluster_assignments, src_label, dst_label, cluster_means_rd, None)
-
-            # Update cluster means and cluster assignments
-            merge_two_clusters(cluster_assignments, src_label, dst_label, cluster_means, cluster_variances, present_cluster_means)
+            # wide means/vars/present: numpy row combine, replicating merge_cluster_means_vars EXACTLY.
+            # Subtlety: in the original, `mean2 = cluster_means.loc[dest]` is a pandas VIEW that is
+            # overwritten to mean_comb (`cluster_means.loc[dest] = mean_comb`) BEFORE the variance line,
+            # so the (mean2 - mean_comb)**2 term is identically zero. Only the source term survives.
+            n1 = cl_size[src_label]; n2 = cl_size[dst_label]
+            rs = row_of[src_label]; rd = row_of[dst_label]
+            m1 = means_np[rs]; m2 = means_np[rd]
+            mean_comb = (m1 * n1 + m2 * n2) / (n1 + n2)
+            v1 = vars_np[rs]; v2 = vars_np[rd]
+            var_comb = 1 / (n1 + n2 - 1) * (
+                (n1 - 1) * v1 + n1 * (m1 - mean_comb) ** 2 +
+                (n2 - 1) * v2
+            )
+            p1 = present_np[rs]; p2 = present_np[rd]
+            present_comb = (p1 * n1 + p2 * n2) / (n1 + n2)
+            means_np[rd] = mean_comb; vars_np[rd] = var_comb; present_np[rd] = present_comb
+            # update assignments (mirrors merge_two_clusters) + bookkeeping
+            cluster_assignments[dst_label].extend(cluster_assignments[src_label])
+            cluster_assignments.pop(src_label)
+            live.discard(src_label)
             merged_clusters.add(src_label)
             merged_clusters.add(dst_label)
             merged_cluster_dsts.add(dst_label)
-
-            # Merge cluster sizes
             cl_size[dst_label] += cl_size[src_label]
             cl_size.pop(src_label)
 
+        if not merged_clusters:
+            break   # nothing merged this round -> converged
+        # invalidate cached scores for any pair touching a merged cluster (means changed)
+        for key in [key for key in de_cache if key & merged_clusters]:
+            del de_cache[key]
+
+    # Rebuild DataFrames of the surviving (live) clusters from the numpy state and return them.
+    # cluster_assignments was mutated in place (unchanged contract); the caller reuses these merged
+    # means/vars/present for marker selection, so they must reflect the merges.
+    final_labels = [lab for lab in labels if lab in live]
+    final_rows = [row_of[lab] for lab in final_labels]
+    cluster_means = pd.DataFrame(means_np[final_rows], index=final_labels, columns=genes)
+    cluster_variances = pd.DataFrame(vars_np[final_rows], index=final_labels, columns=genes)
+    present_cluster_means = pd.DataFrame(present_np[final_rows], index=final_labels, columns=genes)
+    return cluster_means, cluster_variances, present_cluster_means
 
 
 def get_k_nearest_clusters(

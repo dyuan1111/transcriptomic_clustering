@@ -10,12 +10,12 @@ import numpy as np
 import leidenalg
 from annoy import AnnoyIndex
 from scanpy import AnnData
-from scanpy.external.tl import phenograph
 from scipy.sparse import csr_matrix
 from math import log
 import tempfile
 from typing import List
 import igraph as ig
+from scanpy.external.tl import phenograph
 
 
 def cluster_louvain_phenograph(
@@ -40,7 +40,7 @@ def cluster_louvain_phenograph(
     cluster_by_obs: an array of community labels for each cell in adata, in order
     obs_by_cluster: a map of community labels to lists of cell indices in that community in order
     graph: the calculated adjacency graph on the adata
-    q: the maximum modularity of the final clustering 
+    q: the maximum modularity of the final clustering
     """
     if 'copy' in kwargs:
         del kwargs['copy']
@@ -61,13 +61,14 @@ def cluster_louvain_phenograph(
             obs_by_cluster[max_cluster + 1] = [obs]
             cluster_by_obs[obs] = max_cluster + 1
             max_cluster += 1
-        
+
         del obs_by_cluster[-1]
 
     if annotate:
         adata.obs['pheno_louvain'] = cluster_by_obs
 
     return cluster_by_obs, obs_by_cluster, graph, q
+
 
 def _cluster_obs_list_to_dict(cluster_by_obs: List[int]):
     """
@@ -104,12 +105,14 @@ def cluster_louvain(
     resolution: float = 1.,
     annoy_index_filename: str = None,
     graph_filename: str = None,
-    random_seed: int = None
+    random_seed: int = None,
+    jaccard_prune: float = 0.05,
+    jaccard_prune_min_size: int = 50000,
+    annoy_seed: int = 1
 ):
     """
-    Immitates the cluster_louvain_phenograph interface for consistency,
-    but simply wraps separate K Nearest Neighbors functions and graph-parametered
-    Louvain functions.
+    Cluster cells by building an approximate-KNN Jaccard/SNN graph and running
+    Louvain or Leiden community detection on it.
 
     Parameters
     -----------
@@ -148,10 +151,18 @@ def cluster_louvain(
             n_jobs = n_jobs,
             annoy_index_filename = annoy_index_filename,
             graph_filename = graph_filename,
-            random_seed = random_seed
+            random_seed = annoy_seed   # FIXED annoy seed (decoupled from clustering seed) -> seed-invariant KNN graph, like R
         )
     else:
         raise ValueError(f"{knn_method} is not a valid knn method! Only available method is annoy")
+
+    # Match scrattch.bigcat jaccard_big: prune weak jaccard edges (keep weight > prune),
+    # but ONLY for large graphs (n > bin_size=50000), which is where R's nbin>1 branch prunes.
+    if weighting_method in ('jaccard', 'jaccard_snn') and jaccard_prune > 0 and nn_adata.n_obs > jaccard_prune_min_size:
+        Xp = nn_adata.X.tocsr()
+        Xp.data[Xp.data <= jaccard_prune] = 0.0
+        Xp.eliminate_zeros()
+        nn_adata.X = Xp
 
     if louvain_method == 'taynaud':
         cluster_by_obs, q = get_taynaud_louvain(
@@ -258,6 +269,26 @@ def _jaccard_csr_from_nn_dict(nn_dict, n_jobs = 1):
     csr_indptr = [i * k for i in range(n)] + [n * k]
     return csr_matrix((csr_weights, csr_indices, csr_indptr), shape=(n, n), dtype=float)
 
+
+def _jaccard_snn_csr_from_nn_dict(nn_dict):
+    """
+    Full shared-nearest-neighbor (SNN) Jaccard graph, matching R scrattch.bigcat::jaccard_big.
+    Builds the binary KNN membership matrix B (cell x cell, B[i,j]=1 if j in KNN(i)), forms the
+    co-neighbor counts A = B @ B.T (A[i,j] = # neighbors shared by cells i and j), and weights every
+    such pair by Jaccard = shared / (2k - shared). Unlike _jaccard_csr_from_nn_dict (edges only on
+    direct KNN pairs), this creates an edge between EVERY pair of cells that shares >=1 neighbor.
+    """
+    n = len(nn_dict)
+    k = len(nn_dict[0])
+    rows = np.repeat(np.arange(n), k)
+    cols = np.fromiter((j for i in range(n) for j in nn_dict[i]), dtype=np.int64, count=n * k)
+    B = csr_matrix((np.ones(n * k, dtype=np.float32), (rows, cols)), shape=(n, n))
+    A = (B @ B.T).tocoo()                       # shared-neighbor counts (all co-neighbor pairs)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        w = A.data / (2.0 * k - A.data)         # Jaccard
+    return csr_matrix((w.astype(np.float64), (A.row, A.col)), shape=(n, n))
+
+
 def _search_nn_chunk(idx, k, vec_len, nn_measure, annoy_index_filename):
     """
     Given an observation index, loads the annoy index at annoy_index_filename
@@ -319,10 +350,12 @@ def _annoy_build_csr_nn_graph(
 
     if weighting_method == 'jaccard':
         return _jaccard_csr_from_nn_dict(graph_map, n_jobs)
+    if weighting_method == 'jaccard_snn':
+        return _jaccard_snn_csr_from_nn_dict(graph_map)
     if weighting_method == 'uniform':
         return _uniform_csr_from_nn_dict(graph_map)
     else:
-        raise ValueError(f"{weighting_method} is not a valid weighting option! Must use jaccard or uniform")
+        raise ValueError(f"{weighting_method} is not a valid weighting option! Must use jaccard, jaccard_snn or uniform")
 
 def get_annoy_knn(
     adata: AnnData,

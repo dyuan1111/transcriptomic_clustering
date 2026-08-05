@@ -8,8 +8,27 @@ import statsmodels.stats.multitest as multi
 import warnings
 import logging
 import sys
+import gc
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def no_gc_collect():
+    """
+    Temporarily make gc.collect() a no-op. statsmodels' multipletests() calls gc.collect() on EVERY
+    call; in the per-pair DE loops (merge / de_all_pairs / marker selection) that triggers a full
+    garbage collection thousands of times and dominates runtime (~10x slowdown). Wrapping the
+    multipletests call in this context neutralizes those explicit collects (gc.disable() does not,
+    since the call is explicit). Restores gc.collect on exit, so it is exception-safe and global-safe.
+    """
+    _orig = gc.collect
+    gc.collect = lambda *a, **k: 0
+    try:
+        yield
+    finally:
+        gc.collect = _orig
 
 def vec_chisq_test(pair: tuple,
                   cl_present: pd.DataFrame,
@@ -102,7 +121,8 @@ def de_pair_chisq(pair: tuple,
                             cl_present_sorted,
                             cl_size)
     
-    reject, p_adj, alphacSidak, alphacBonf = multi.multipletests(p_vals, method="holm", is_sorted=False)
+    with no_gc_collect():
+        reject, p_adj, alphacSidak, alphacBonf = multi.multipletests(p_vals, method="holm", is_sorted=False)
     lfc = cl_means_sorted.loc[first_cluster].to_numpy() - cl_means_sorted.loc[second_cluster].to_numpy()
 
     q1 = cl_present_sorted.loc[first_cluster].to_numpy()
@@ -220,7 +240,7 @@ def get_qdiff(q1, q2) -> np.array:
     qmax = np.maximum(q1, q2)
     qmax[qmax == 0] = np.nan
     q_diff = abs(q1 - q2) / qmax
-    q_diff = np.nan_to_num(q_diff, nan=0.0)
+    np.nan_to_num(q_diff, nan=0.0, copy=False)
 
     return q_diff
 
@@ -240,8 +260,15 @@ def calc_de_score(
     -------
     differential expression score
     """
-    with np.errstate(divide='ignore'): # allow de_score = inf for padj = 0
-        de_score = np.sum(-np.log10(padj)) if len(padj) else 0
+    with np.errstate(divide='ignore'): # -log10(padj) may be inf for padj = 0
+        if len(padj):
+            gene_scores = -np.log10(padj)
+            # cap each gene's contribution at 20 to match scrattch.bigcat de_stats_pair
+            # (R clips -log10(padj) to 20 before summing); this also bounds padj==0 (inf) to 20
+            gene_scores = np.minimum(gene_scores, 20)
+            de_score = np.sum(gene_scores)
+        else:
+            de_score = 0
 
     return de_score
 

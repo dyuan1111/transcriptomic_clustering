@@ -13,7 +13,7 @@ from scipy import stats
 from scipy.special import digamma, polygamma
 from statsmodels.stats.multitest import multipletests
 
-from .diff_expression import get_qdiff, filter_gene_stats, calc_de_score
+from .diff_expression import get_qdiff, filter_gene_stats, calc_de_score, no_gc_collect
 
 import multiprocessing as mp
 from functools import partial
@@ -175,62 +175,67 @@ def de_pairs_ebayes(
     sigma_sq_post, var_prior, df_prior = moderate_variances(sigma_sq, df)
 
     logger.info(f'Comparing {len(pairs)} pairs')
+    # --- vectorized (numpy) setup: avoids building a per-pair 8-column DataFrame + pandas
+    #     filter_gene_stats, which dominated runtime. Logic is identical to filter_gene_stats. ---
+    genes = np.asarray(cl_means.columns)
+    row_of = {c: i for i, c in enumerate(cl_means.index)}
+    means_np = np.asarray(cl_means.values)
+    present_np = np.asarray(cl_present.values)
+    sqrt_sigma = np.sqrt(np.asarray(sigma_sq_post).ravel())
+    df_total = min(df + df_prior, np.sum(df))   # scalar (df is the residual dof); kept as the original formula
+    padj_th = de_thresholds.get('padj_thresh'); lfc_th = de_thresholds.get('lfc_thresh')
+    q1_th = de_thresholds.get('q1_thresh'); q2_th = de_thresholds.get('q2_thresh')
+    cs_th = de_thresholds.get('cluster_size_thresh'); qd_th = de_thresholds.get('qdiff_thresh')
+
+    def _score(padj_sel):
+        if padj_sel.size == 0:
+            return 0.0
+        with np.errstate(divide='ignore'):   # padj==0 -> inf -> capped at 20 (matches calc_de_score)
+            return float(np.minimum(-np.log10(padj_sel), 20.0).sum())
+
     de_pairs = {}
     for (cluster_a, cluster_b) in pairs:
-        # t-test with ebayes adjusted variances
-        means_diff = cl_means.loc[cluster_a] - cl_means.loc[cluster_b]
-        means_diff = means_diff.to_frame()
-        stdev_unscaled_comb = np.sqrt(np.sum(stdev_unscaled.loc[[cluster_a, cluster_b]] ** 2))
-        
-        df_total = df + df_prior
-        df_pooled = np.sum(df)
-        df_total = min(df_total, df_pooled)
-        
-        t_vals = means_diff / np.sqrt(sigma_sq_post) / stdev_unscaled_comb
-        
-        p_adj = np.ones((len(t_vals),))
-        p_vals = 2 * stats.t.sf(np.abs(t_vals[0]), df_total)
-        reject, p_adj, alphacSidak, alphacBonf= multipletests(p_vals, alpha=de_thresholds['padj_thresh'], method='holm')
-        lfc = means_diff
+        ia, ib = row_of[cluster_a], row_of[cluster_b]
+        lfc = means_np[ia] - means_np[ib]                              # means_diff
+        stdev_unscaled_comb = np.sqrt(1.0 / cl_size[cluster_a] + 1.0 / cl_size[cluster_b])
+        t_vals = lfc / sqrt_sigma / stdev_unscaled_comb
+        p_vals = 2 * stats.t.sf(np.abs(t_vals), df_total)
+        with no_gc_collect():
+            p_adj = multipletests(p_vals, alpha=de_thresholds['padj_thresh'], method='holm')[1]
 
-        # Get DE score
-        de_pair_stats = pd.DataFrame(index=cl_means.columns)
-        de_pair_stats['p_value'] = p_vals
-        de_pair_stats['p_adj'] = p_adj
-        de_pair_stats['lfc'] = lfc
-        de_pair_stats["meanA"] = cl_means.loc[cluster_a]
-        de_pair_stats["meanB"] = cl_means.loc[cluster_b]
-        de_pair_stats["q1"] = cl_present.loc[cluster_a]
-        de_pair_stats["q2"] = cl_present.loc[cluster_b]
-        de_pair_stats["qdiff"] = get_qdiff(cl_present.loc[cluster_a], cl_present.loc[cluster_b])
+        q1 = present_np[ia]; q2 = present_np[ib]
+        qdiff = get_qdiff(q1, q2)
+        sa, sb = cl_size[cluster_a], cl_size[cluster_b]
 
-        de_pair_up = filter_gene_stats(
-            de_stats=de_pair_stats,
-            gene_type='up-regulated', 
-            cl1_size=cl_size[cluster_a],
-            cl2_size=cl_size[cluster_b],
-            **de_thresholds
-        )
-        up_score = calc_de_score(de_pair_up['p_adj'].values)
+        # replicate filter_gene_stats masks exactly (up: qa=q1/qb=q2/size=sa; down: qa=q2/qb=q1/size=sb)
+        up = lfc > 0
+        down = lfc < 0
+        if padj_th:
+            m = p_adj < padj_th; up = up & m; down = down & m
+        if lfc_th:
+            m = np.abs(lfc) > lfc_th; up = up & m; down = down & m
+        if q1_th:
+            up = up & (q1 > q1_th); down = down & (q2 > q1_th)
+        if sa:
+            up = up & (q1 * sa >= cs_th)
+        if sb:
+            down = down & (q2 * sb >= cs_th)
+        if q2_th:
+            up = up & (q2 < q2_th); down = down & (q1 < q2_th)
+        if qd_th:
+            m = np.abs(qdiff) > qd_th; up = up & m; down = down & m
 
-        de_pair_down = filter_gene_stats(
-            de_stats=de_pair_stats,
-            gene_type='down-regulated',
-            cl1_size=cl_size[cluster_a],
-            cl2_size=cl_size[cluster_b],
-            **de_thresholds
-        )
-        down_score = calc_de_score(de_pair_down['p_adj'].values)
-
+        up_score = _score(p_adj[up]); down_score = _score(p_adj[down])
+        up_num = int(up.sum()); down_num = int(down.sum())
         de_pairs[(cluster_a, cluster_b)] = {
             'score': up_score + down_score,
             'up_score': up_score,
             'down_score': down_score,
-            'up_genes': de_pair_up.index.to_list(),
-            'down_genes': de_pair_down.index.to_list(),
-            'up_num': len(de_pair_up.index),
-            'down_num': len(de_pair_down.index),
-            'num': len(de_pair_up.index) + len(de_pair_down.index)
+            'up_genes': genes[up].tolist(),
+            'down_genes': genes[down].tolist(),
+            'up_num': up_num,
+            'down_num': down_num,
+            'num': up_num + down_num,
         }
 
     de_pairs = pd.DataFrame(de_pairs).T
@@ -241,7 +246,7 @@ def process_pair(cl_means, cl_present, cl_size, stdev_unscaled, df, df_prior, si
     # t-test with ebayes adjusted variances
     means_diff = cl_means.loc[cluster_a] - cl_means.loc[cluster_b]
     means_diff = means_diff.to_frame()
-    stdev_unscaled_comb = np.sqrt(np.sum(stdev_unscaled.loc[[cluster_a, cluster_b]] ** 2))
+    stdev_unscaled_comb = np.sqrt(np.sum(stdev_unscaled.loc[[cluster_a, cluster_b]] ** 2))[0]
     
     df_total = df + df_prior
     df_pooled = np.sum(df)
@@ -251,7 +256,8 @@ def process_pair(cl_means, cl_present, cl_size, stdev_unscaled, df, df_prior, si
     
     p_adj = np.ones((len(t_vals),))
     p_vals = 2 * stats.t.sf(np.abs(t_vals[0]), df_total)
-    reject, p_adj, alphacSidak, alphacBonf= multipletests(p_vals, alpha=de_thresholds['padj_thresh'], method='holm')
+    with no_gc_collect():
+        reject, p_adj, alphacSidak, alphacBonf= multipletests(p_vals, alpha=de_thresholds['padj_thresh'], method='holm')
     lfc = means_diff
 
     # Get DE score
