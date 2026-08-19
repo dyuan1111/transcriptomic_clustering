@@ -13,3 +13,4 @@ networkx
 leidenalg==0.8.4
 python-louvain
 click
+pyarrow  # binned parquet output for de_all_pairs / read_de_pairs

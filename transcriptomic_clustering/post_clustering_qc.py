@@ -1,5 +1,5 @@
 """
-Post-clustering QC — Python port of scrattch.bigcat's post_clustering_qc functions.
+Post-clustering QC — Python port of scrattch.bigcat's post-clustering qc functions and scripts.
 
 Provides:
   - create_pairs / get_pairs         : cluster-pair enumeration / parsing
@@ -12,7 +12,10 @@ Provides:
 DE uses the same eBayes moderated-t as the merge step (de_ebayes), so scores are consistent.
 """
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 import itertools
+import json
+import os
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -47,6 +50,149 @@ def _logpval(padj: np.ndarray) -> np.ndarray:
     return np.minimum(lp, SCORE_CAP)
 
 
+def make_cl_bin(clusters, bin_size: int = 100) -> Dict[str, int]:
+    """
+    Assign clusters to bins, mirroring scrattch.bigcat's
+    `cl.bin = data.frame(cl=cn, bin=ceiling((1:length(cn)/cl.bin.size)))`.
+
+    Clusters are sorted numerically when every label is integer-like, otherwise lexicographically,
+    then chopped into consecutive groups of `bin_size` (bins are 1-based, as in R).
+    """
+    labels = [str(c) for c in clusters]
+    try:
+        order = sorted(labels, key=int)
+    except ValueError:
+        order = sorted(labels)
+    return {c: i // bin_size + 1 for i, c in enumerate(order)}
+
+
+def _bin_pair(a, b, cl_bin: Dict[str, int]) -> Tuple[int, int]:
+    """Bin-pair a cluster pair belongs to, ordered bin.x <= bin.y (R writes the upper triangle only)."""
+    bx, by = cl_bin[str(a)], cl_bin[str(b)]
+    return (bx, by) if bx <= by else (by, bx)
+
+
+def _partition_path(root: str, bin_x: int, bin_y: int) -> str:
+    """Hive-style partition directory, matching R's file.path(out.dir, "bin.x=X", "bin.y=Y")."""
+    return os.path.join(root, f"bin.x={bin_x}", f"bin.y={bin_y}")
+
+
+def _write_partition(df: pd.DataFrame, root: str, bin_x: int, bin_y: int) -> None:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as err:
+        raise ImportError(
+            "Writing binned DE results requires pyarrow (pip install pyarrow). "
+            "Omit out_dir/summary_dir to keep results in memory instead."
+        ) from err
+    d = _partition_path(root, bin_x, bin_y)
+    os.makedirs(d, exist_ok=True)
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False),
+                   os.path.join(d, "part-0.parquet"))
+
+
+def _save_cl_bin(root: str, cl_bin: Dict[str, int]) -> None:
+    """Store cl_bin beside the dataset so readers can map pairs to partitions without it being passed."""
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, "_cl_bin.json"), "w") as f:
+        json.dump({str(k): int(v) for k, v in cl_bin.items()}, f)
+
+
+def load_cl_bin(root: str) -> Dict[str, int]:
+    """Load the cl_bin mapping saved next to a binned DE dataset."""
+    with open(os.path.join(root, "_cl_bin.json")) as f:
+        return json.load(f)
+
+
+def read_de_pairs(root: str,
+                  pairs: Optional[List[Tuple[Any, Any]]] = None,
+                  cl_bin: Optional[Dict[str, int]] = None,
+                  columns: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Read DE rows for specific cluster pairs from a binned dataset written by `de_all_pairs`.
+
+    Only the partitions those pairs live in are opened -- the whole point of the bin layout.
+    Works for both the detail (out_dir) and summary (summary_dir) datasets.
+
+    Parameters
+    ----------
+    root: dataset directory written by de_all_pairs
+    pairs: cluster pairs to fetch; None reads the entire dataset
+    cl_bin: cluster -> bin map; read from `root/_cl_bin.json` when omitted
+    columns: subset of columns to read
+
+    Returns
+    -------
+    DataFrame of the matching rows (empty if none of the pairs are present)
+    """
+    try:
+        import pyarrow.dataset as pads
+    except ImportError as err:
+        raise ImportError("Reading binned DE results requires pyarrow (pip install pyarrow).") from err
+
+    if pairs is None:
+        ds = pads.dataset(root, format="parquet", partitioning="hive")
+        return ds.to_table(columns=columns).to_pandas()
+
+    if cl_bin is None:
+        cl_bin = load_cl_bin(root)
+    pairs = [(str(a), str(b)) for a, b in pairs]
+    wanted = {f"{a}_{b}" for a, b in pairs} | {f"{b}_{a}" for a, b in pairs}
+
+    # map the requested pairs to their partitions and open only those
+    parts = sorted({_partition_path(root, *_bin_pair(a, b, cl_bin)) for a, b in pairs})
+    files = [os.path.join(d, f) for d in parts if os.path.isdir(d)
+             for f in sorted(os.listdir(d)) if f.endswith(".parquet")]
+    if not files:
+        return pd.DataFrame(columns=columns or [])
+    df = pads.dataset(files, format="parquet").to_table(columns=columns).to_pandas()
+    return df[df["pair"].isin(wanted)].reset_index(drop=True)
+
+
+def _de_one_pair(a, b, cluster_means, present_cluster_means, cl_size, genes, sqrt_sigma,
+                 stdev_unscaled, df, df_prior, df_pooled, filt, padj_alpha, top_n, want_detail):
+    """eBayes DE for a single cluster pair -> (summary row, detail frame or None)."""
+    means_diff = (cluster_means.loc[a] - cluster_means.loc[b]).to_frame()
+    stdev_comb = np.sqrt(np.sum(stdev_unscaled.loc[[a, b]] ** 2))[0]
+    df_total = min(df + df_prior, df_pooled)
+    t_vals = means_diff / sqrt_sigma / stdev_comb
+    p_vals = 2 * stats.t.sf(np.abs(t_vals[0]), df_total)
+    _, p_adj, _, _ = multipletests(p_vals, alpha=padj_alpha, method='holm')
+
+    s = pd.DataFrame(index=genes)
+    s['p_value'] = p_vals; s['p_adj'] = p_adj; s['lfc'] = means_diff.values
+    s['q1'] = present_cluster_means.loc[a].values
+    s['q2'] = present_cluster_means.loc[b].values
+    s['qdiff'] = get_qdiff(present_cluster_means.loc[a].values, present_cluster_means.loc[b].values)
+
+    up = filter_gene_stats(s, 'up-regulated', cl1_size=cl_size[a], cl2_size=cl_size[b], **filt)
+    down = filter_gene_stats(s, 'down-regulated', cl1_size=cl_size[a], cl2_size=cl_size[b], **filt)
+    up = up.sort_values('p_adj'); down = down.sort_values('p_adj')
+    up_lp = _logpval(up['p_adj'].to_numpy()); down_lp = _logpval(down['p_adj'].to_numpy())
+
+    summ_row = {
+        'pair': f"{a}_{b}", 'P1': a, 'P2': b,
+        'up_num': len(up), 'down_num': len(down), 'num': len(up) + len(down),
+        'up_score': float(up_lp.sum()), 'down_score': float(down_lp.sum()),
+        'score': float(up_lp.sum() + down_lp.sum()),
+    }
+    if not want_detail:
+        return summ_row, None
+
+    uh, dh = up.head(top_n), down.head(top_n)
+    uh_lp, dh_lp = up_lp[:len(uh)], down_lp[:len(dh)]
+    d = pd.DataFrame({
+        'pair': f"{a}_{b}", 'P1': a, 'P2': b,
+        'gene': list(uh.index) + list(dh.index),
+        'logPval': np.concatenate([uh_lp, dh_lp]),
+        'sign': ['up'] * len(uh) + ['down'] * len(dh),
+        'rank': list(range(1, len(uh) + 1)) + list(range(1, len(dh) + 1)),
+        'lfc': np.abs(np.concatenate([uh['lfc'].to_numpy(), dh['lfc'].to_numpy()])),
+    })
+    return summ_row, (d if len(d) else None)
+
+
 def de_all_pairs(
         cluster_means: pd.DataFrame,     # clusters x genes (normalized)
         cluster_variances: pd.DataFrame, # clusters x genes
@@ -54,21 +200,42 @@ def de_all_pairs(
         cl_size: Dict[Any, int],
         thresholds: Dict[str, Any],
         pairs: Optional[List[Tuple[Any, Any]]] = None,
-        top_n: int = 1000,
+        top_n: int = 500,
         return_detail: bool = True,
-) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        out_dir: Optional[str] = None,
+        summary_dir: Optional[str] = None,
+        cl_bin: Optional[Dict[str, int]] = None,
+        bin_size: int = 100,
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """
     Compute eBayes DE for ALL (or given) cluster pairs. Mirrors scrattch.bigcat de_all_pairs
     (+ its de_summary / de_parquet outputs).
 
+    With `out_dir` / `summary_dir`, results stream to disk in scrattch.bigcat's binned layout --
+    clusters are assigned to bins of `bin_size` and each bin-pair is written to
+    `<dir>/bin.x=X/bin.y=Y/part-0.parquet` -- so an all-pairs run never holds every pair in memory
+    and any pair can be read back later with `read_de_pairs` by opening only its partition.
+    `_cl_bin.json` is saved alongside so readers are self-contained. Requires pyarrow.
+
+    Parameters
+    ----------
+    pairs: pairs to test; None enumerates all pairs of cluster_means.index
+    top_n: detail genes kept per direction per pair (R de_selected_pairs default: 500)
+    return_detail: build the per-gene detail (ignored for a dataset already written to out_dir)
+    out_dir / summary_dir: write detail / summary as binned parquet instead of returning them
+    cl_bin: cluster -> bin map; built from `bin_size` when omitted
+    bin_size: clusters per bin (R cl.bin.size default: 100)
+
     Returns
     -------
-    summary : DataFrame [pair, P1, P2, up_num, down_num, num, up_score, down_score, score]
-    detail  : DataFrame [pair, P1, P2, gene, logPval, sign, rank, lfc]  (top_n up + top_n down
-              per pair; None if return_detail=False). `sign` = 'up' means higher in P1.
+    summary : DataFrame [pair, P1, P2, up_num, down_num, num, up_score, down_score, score],
+              or None when written to `summary_dir`
+    detail  : DataFrame [pair, P1, P2, gene, logPval, sign, rank, lfc], or None when written to
+              `out_dir` or when return_detail=False. `sign` = 'up' means higher in P1.
     """
     if pairs is None:
         pairs = create_pairs(cluster_means.index)
+    pairs = [(str(a), str(b)) for a, b in pairs]
     filt = {k: thresholds.get(k) for k in _FILTER_KEYS}
 
     # eBayes fit ONCE across all clusters (same as de_pairs_ebayes)
@@ -77,53 +244,57 @@ def de_all_pairs(
     df_pooled = np.sum(df)
     sqrt_sigma = np.sqrt(sigma_sq_post)
     genes = cluster_means.columns
+    padj_alpha = thresholds['padj_thresh']
 
-    summ_rows, detail_frames = [], []
-    for a, b in pairs:
-        a, b = str(a), str(b)
-        means_diff = (cluster_means.loc[a] - cluster_means.loc[b]).to_frame()
-        stdev_comb = np.sqrt(np.sum(stdev_unscaled.loc[[a, b]] ** 2))[0]
-        df_total = min(df + df_prior, df_pooled)
-        t_vals = means_diff / sqrt_sigma / stdev_comb
-        p_vals = 2 * stats.t.sf(np.abs(t_vals[0]), df_total)
-        _, p_adj, _, _ = multipletests(p_vals, alpha=thresholds['padj_thresh'], method='holm')
+    def _run(a, b, want_detail):
+        return _de_one_pair(a, b, cluster_means, present_cluster_means, cl_size, genes, sqrt_sigma,
+                            stdev_unscaled, df, df_prior, df_pooled, filt, padj_alpha,
+                            top_n, want_detail)
 
-        s = pd.DataFrame(index=genes)
-        s['p_value'] = p_vals; s['p_adj'] = p_adj; s['lfc'] = means_diff.values
-        s['q1'] = present_cluster_means.loc[a].values
-        s['q2'] = present_cluster_means.loc[b].values
-        s['qdiff'] = get_qdiff(present_cluster_means.loc[a].values, present_cluster_means.loc[b].values)
-
-        up = filter_gene_stats(s, 'up-regulated', cl1_size=cl_size[a], cl2_size=cl_size[b], **filt)
-        down = filter_gene_stats(s, 'down-regulated', cl1_size=cl_size[a], cl2_size=cl_size[b], **filt)
-        up = up.sort_values('p_adj'); down = down.sort_values('p_adj')
-        up_lp = _logpval(up['p_adj'].to_numpy()); down_lp = _logpval(down['p_adj'].to_numpy())
-
-        summ_rows.append({
-            'pair': f"{a}_{b}", 'P1': a, 'P2': b,
-            'up_num': len(up), 'down_num': len(down), 'num': len(up) + len(down),
-            'up_score': float(up_lp.sum()), 'down_score': float(down_lp.sum()),
-            'score': float(up_lp.sum() + down_lp.sum()),
-        })
-
-        if return_detail:
-            uh, dh = up.head(top_n), down.head(top_n)
-            uh_lp, dh_lp = up_lp[:len(uh)], down_lp[:len(dh)]
-            d = pd.DataFrame({
-                'pair': f"{a}_{b}", 'P1': a, 'P2': b,
-                'gene': list(uh.index) + list(dh.index),
-                'logPval': np.concatenate([uh_lp, dh_lp]),
-                'sign': ['up'] * len(uh) + ['down'] * len(dh),
-                'rank': list(range(1, len(uh) + 1)) + list(range(1, len(dh) + 1)),
-                'lfc': np.abs(np.concatenate([uh['lfc'].to_numpy(), dh['lfc'].to_numpy()])),
-            })
-            if len(d):
+    to_disk = out_dir is not None or summary_dir is not None
+    if not to_disk:
+        summ_rows, detail_frames = [], []
+        for a, b in pairs:
+            row, d = _run(a, b, return_detail)
+            summ_rows.append(row)
+            if d is not None:
                 detail_frames.append(d)
+        summary = pd.DataFrame(summ_rows)
+        detail = pd.concat(detail_frames, ignore_index=True) if (return_detail and detail_frames) else \
+            (pd.DataFrame(columns=['pair', 'P1', 'P2', 'gene', 'logPval', 'sign', 'rank', 'lfc'])
+             if return_detail else None)
+        return summary, detail
 
-    summary = pd.DataFrame(summ_rows)
-    detail = pd.concat(detail_frames, ignore_index=True) if (return_detail and detail_frames) else \
-        (pd.DataFrame(columns=['pair', 'P1', 'P2', 'gene', 'logPval', 'sign', 'rank', 'lfc']) if return_detail else None)
-    return summary, detail
+    # --- binned, streamed to disk: one partition per bin-pair, nothing accumulated across bins ---
+    if cl_bin is None:
+        cl_bin = make_cl_bin(cluster_means.index, bin_size=bin_size)
+    for root in (out_dir, summary_dir):
+        if root is not None:
+            _save_cl_bin(root, cl_bin)
+
+    by_bin: Dict[Tuple[int, int], List[Tuple[str, str]]] = defaultdict(list)
+    for a, b in pairs:
+        by_bin[_bin_pair(a, b, cl_bin)].append((a, b))
+
+    want_detail = out_dir is not None and return_detail
+    kept_summary: List[Dict[str, Any]] = []
+    for (bx, by), bin_pairs in sorted(by_bin.items()):
+        rows, frames = [], []
+        for a, b in bin_pairs:
+            row, d = _run(a, b, want_detail)
+            rows.append(row)
+            if d is not None:
+                frames.append(d)
+        if out_dir is not None and frames:
+            _write_partition(pd.concat(frames, ignore_index=True), out_dir, bx, by)
+        if summary_dir is not None:
+            _write_partition(pd.DataFrame(rows), summary_dir, bx, by)
+        else:
+            kept_summary.extend(rows)
+        del rows, frames
+
+    summary = None if summary_dir is not None else pd.DataFrame(kept_summary)
+    return summary, None
 
 
 def find_doublet_by_marker(cluster_means: pd.DataFrame, markers: Dict[str, List[str]], th: float = 3.5) -> pd.DataFrame:
