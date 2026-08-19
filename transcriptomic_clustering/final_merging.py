@@ -93,23 +93,32 @@ def final_merge(
         n_jobs: Optional[int] = 1,
         return_markers_df: Optional[bool] = False,
         final_merge_kwargs: FinalMergeKwargs = FinalMergeKwargs(),
+        space: Optional[str] = None,
+        rm_genes: Optional[List] = None,
 ) -> Tuple[List[List[int]], Union[pd.DataFrame, set]]:
     """
-    Runs a final merging step on cluster assignment results
-    Step1: Using a pre-defined latent space or compute PCA as below:
-    * Do PCA on random sample of cells per cluster and selected marker genes
-    * Filter PCA results to select top eigenvectors
-    * Project to reduced space
-    * remove known eigen vector
-   Step2: Do differential expression merge
+    Runs a final merging step on cluster assignment results.
+
+    Step 1 builds the reduced space used for candidate-pair selection (`space`):
+      * 'markers' - raw normalized marker-gene expression (cells x selected markers), no PCA.
+                    Matches scrattch.bigcat `merge.R` (`rd.dat = t(norm.dat[markers, ])`).
+      * 'latent'  - a precomputed embedding, via `final_merge_kwargs.latent_kwargs['latent_component']`.
+      * 'pca'     - PCA on a per-cluster cell sample restricted to the marker genes, then project.
+    Step 2 runs the differential-expression merge (`merge_clusters`) on that reduced space.
 
     Parameters
     ----------
     adata
-        AnnData object
+        AnnData object (normalized).
     cluster_assignments
-        List of arrays of cell ids, one array per cluster. This is the result returned by onestep_clust/iter_clust
-    
+        List of arrays of cell ids, one array per cluster (result of onestep_clust/iter_clust).
+    marker_genes
+        Genes used by the 'markers' and 'pca' spaces.
+    space
+        Reduced space for candidate selection: 'markers', 'latent', or 'pca'. Default None keeps the
+        backward-compatible behavior: 'latent' if a latent_component is set, else 'pca'.
+    rm_genes
+        Genes to drop from marker_genes for the 'markers' space (e.g. sex/mito), matching R `rm.genes`.
     """
 
     obs_by_cluster = defaultdict(lambda: [])
@@ -118,7 +127,22 @@ def final_merge(
     
     cluster_by_obs = _cluster_obs_dict_to_list(obs_by_cluster)
 
-    if final_merge_kwargs.latent_kwargs.get("latent_component") is None:
+    # Choose the reduced space that feeds candidate-pair selection in merge_clusters (see docstring).
+    if space is None:
+        space = 'latent' if final_merge_kwargs.latent_kwargs.get("latent_component") is not None else 'pca'
+
+    if space == 'markers':
+        # scrattch.bigcat merge.R: rd.dat = raw normalized marker-gene expression; candidate KNN on markers.
+        if marker_genes is None:
+            raise ValueError("space='markers' requires marker_genes")
+        _rm = set(rm_genes) if rm_genes else set()
+        markers_list = [g for g in marker_genes if g not in _rm and g in adata.var_names]
+        if not markers_list:
+            raise ValueError("No marker genes present in adata.var_names for the marker-gene final merge")
+        logger.info(f'Final merge on marker-gene space ({len(markers_list)} genes)')
+        projected_adata = adata[:, markers_list].copy()
+
+    elif space == 'pca':
 
         if marker_genes is None:
             raise ValueError("Need marker genes to run PCA")
@@ -189,16 +213,19 @@ def final_merge(
             logger.info(f'Filter Known Modes Elapsed Time: {toc - tic}')
         else:
             logger.info('No known modes, skipping Filter Known Modes')
-    
-    else:
-        logger.info('Extracting latent dims')
-        tic = time.perf_counter()   
 
-         ## Extract latent dimensions
+    elif space == 'latent':
+        logger.info('Extracting latent dims')
+        tic = time.perf_counter()
+
+        ## Extract latent dimensions
         projected_adata = tc.latent_project(adata, **final_merge_kwargs.latent_kwargs)
 
         toc = time.perf_counter()
         logger.info(f'Extracting latent dims Elapsed Time: {toc - tic}')
+
+    else:
+        raise ValueError(f"Unknown space {space!r}; use 'markers', 'latent', or 'pca'")
 
     # Merging
     logger.info('Starting Cluster Merging')
