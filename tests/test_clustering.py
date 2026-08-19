@@ -9,7 +9,11 @@ from mock import patch
 from unittest.mock import MagicMock
 
 import transcriptomic_clustering as tc
-from transcriptomic_clustering.clustering import cluster_louvain_phenograph
+from transcriptomic_clustering.clustering import (
+    cluster_louvain_phenograph,
+    _annoy_build_csr_nn_graph,
+    _uniform_csr_from_nn_dict,
+)
 
 DIR_NAME = os.path.dirname(__file__)
 TEST_RANDOM_SEED = 5
@@ -152,3 +156,30 @@ def test_get_taynaud_louvain_reproducibility(sample_graph, annoy_taynaud_sample_
 def test_get_vtraag_leiden_reproducibility(sample_graph, annoy_vtraag_sample_partition):
     cluster_by_obs, _ = tc.clustering.get_vtraag_leiden(sample_graph, random_seed=TEST_RANDOM_SEED)
     assert cluster_by_obs == annoy_vtraag_sample_partition
+
+def test_annoy_parallel_search_matches_reference(tmp_path):
+    """
+    Regression test: each pool worker loads the annoy index once (via the initializer) and
+    queries a block of observations. The resulting graph must match a direct, single-index
+    reference -- i.e. every observation is queried exactly once and reassembled at its own index.
+    """
+    rng = np.random.default_rng(0)
+    data = rng.random((200, 8)).astype(np.float32)
+
+    index_file = str(tmp_path / "index.ann")
+    ai = AnnoyIndex(data.shape[1], "euclidean")
+    ai.on_disk_build(index_file)
+    ai.set_seed(TEST_RANDOM_SEED)
+    for i, row in enumerate(data):
+        ai.add_item(i, row)
+    ai.build(10)
+
+    reference = {i: ai.get_nns_by_item(i, TEST_K) for i in range(data.shape[0])}
+    expected = _uniform_csr_from_nn_dict(dict(reference))
+
+    for n_jobs in (1, 4):
+        actual = _annoy_build_csr_nn_graph(
+            data, index_file, k=TEST_K, n_jobs=n_jobs, weighting_method="uniform"
+        )
+        assert actual.shape == expected.shape
+        assert (actual != expected).nnz == 0, f"graph differs for n_jobs={n_jobs}"

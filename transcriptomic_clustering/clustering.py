@@ -289,27 +289,43 @@ def _jaccard_snn_csr_from_nn_dict(nn_dict):
     return csr_matrix((w.astype(np.float64), (A.row, A.col)), shape=(n, n))
 
 
-def _search_nn_chunk(idx, k, vec_len, nn_measure, annoy_index_filename):
+# Per-worker annoy index cache. The index is immutable and identical for every query, so each
+# pool worker memory-maps it once (via _init_annoy_worker) instead of re-opening it per observation.
+_ANNOY_WORKER = {}
+
+
+def _init_annoy_worker(vec_len, nn_measure, annoy_index_filename):
     """
-    Given an observation index, loads the annoy index at annoy_index_filename
-    and requests k nearest neighbors from that index.
+    Pool initializer: memory-map the annoy index once per worker process.
 
     Parameters
     -----------
-    idx: index of the observation to find nearest neighbors for
-    k: number of nearest neighbors to find
     vec_len: length of the observation vectors
     nn_measure: distance metric used to evaluate nearest neighbors on this index
     annoy_index_filename: location of the file-cached annoy index
-
-    Returns
-    -----------
-    idx: index of the evaluated observation
-    nn_list: list of the indices of the k nearest neighbors to the observation at idx
     """
     ai = AnnoyIndex(vec_len, nn_measure)
     ai.load(annoy_index_filename)
-    return idx, ai.get_nns_by_item(idx, k)
+    _ANNOY_WORKER['index'] = ai
+
+
+def _search_nn_chunk(idx_block, k):
+    """
+    Find the k nearest neighbors for a block of observations, querying the annoy index
+    that _init_annoy_worker loaded once for this worker process.
+
+    Parameters
+    -----------
+    idx_block: iterable of observation indices to find nearest neighbors for
+    k: number of nearest neighbors to find
+
+    Returns
+    -----------
+    list of (idx, nn_list) pairs, where nn_list holds the indices of the k nearest
+    neighbors to the observation at idx
+    """
+    ai = _ANNOY_WORKER['index']
+    return [(idx, ai.get_nns_by_item(idx, k)) for idx in idx_block]
 
 def _annoy_build_csr_nn_graph(
     data_matrix: np.array,
@@ -339,14 +355,17 @@ def _annoy_build_csr_nn_graph(
     nn_csr: csr_matrix of weighted neaerest neighbors
     """
     n, vec_len = data_matrix.shape
-    pool = Pool(processes=n_jobs)
     graph_map = {}
     chunk_size = min(max(1, int(n / n_jobs)), 10000)
-    picklable_search = functools.partial(_search_nn_chunk, k=k, vec_len=vec_len, nn_measure=nn_measure, annoy_index_filename=annoy_index_filename)
-    for chunk_result in tqdm(pool.imap_unordered(picklable_search, range(n), chunksize=chunk_size), total=n):
-        graph_map[chunk_result[0]] = chunk_result[1]
-
-    pool.close()
+    # Dispatch blocks of indices; each worker loads the index once (initializer) and queries the block.
+    idx_blocks = [range(start, min(start + chunk_size, n)) for start in range(0, n, chunk_size)]
+    picklable_search = functools.partial(_search_nn_chunk, k=k)
+    with Pool(processes=n_jobs,
+              initializer=_init_annoy_worker,
+              initargs=(vec_len, nn_measure, annoy_index_filename)) as pool:
+        for block_result in tqdm(pool.imap_unordered(picklable_search, idx_blocks), total=len(idx_blocks)):
+            for idx, nn_list in block_result:
+                graph_map[idx] = nn_list
 
     if weighting_method == 'jaccard':
         return _jaccard_csr_from_nn_dict(graph_map, n_jobs)
