@@ -74,8 +74,16 @@ def get_cluster_means_inmemory(
 
     for clust in cluster_assignments.values():
         sliced_X = adata.X[clust, :]
+        n_cells_in_cluster = sliced_X.shape[0]
         cluster_means_lst.append(np.asarray(np.mean(sliced_X, axis=0)).ravel())
-        present_cluster_means_lst.append(np.asarray(np.mean((sliced_X > low_th), axis=0)).ravel())
+        # Count, then divide once -- do NOT use np.mean on the sparse mask. scipy's sparse mean is a
+        # matvec against a vector of 1/n, i.e. it adds 1/n to itself k times, so an exact half such as
+        # 227/454 comes out one ulp ABOVE 0.5 (0.50000000000000144) and wrongly passes the strict
+        # `q1 > q1_thresh` test at 0.5. Detection rates are exact rationals k/n and the q1 threshold is
+        # routinely 0.5, so this flips real genes. Counting keeps present exact, matching
+        # scrattch.bigcat (which counts in C++ and divides once) and get_cluster_means_backed below.
+        present_count = np.asarray((sliced_X > low_th).sum(axis=0)).ravel()
+        present_cluster_means_lst.append(present_count / n_cells_in_cluster)
 
         if issparse(sliced_X):
             sliced_X = sliced_X.toarray()
