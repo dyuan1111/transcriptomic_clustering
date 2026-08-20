@@ -1,6 +1,7 @@
 from annoy import AnnoyIndex
 import scanpy as sc
 import numpy as np
+import pandas as pd
 import pytest
 import csv
 import os
@@ -183,3 +184,43 @@ def test_annoy_parallel_search_matches_reference(tmp_path):
         )
         assert actual.shape == expected.shape
         assert (actual != expected).nnz == 0, f"graph differs for n_jobs={n_jobs}"
+
+
+def test_pynndescent_handles_subsets_smaller_than_k():
+    """
+    The recursive pipeline drills down to groups of a few dozen cells, where k can exceed the number
+    of points. annoy returns min(k, n) neighbours; pynndescent instead pads unfilled slots with -1,
+    which reaches csr_matrix as a negative index and aborts graph construction. Both backends must
+    survive these sizes.
+    """
+    pytest.importorskip("pynndescent")
+    import anndata as ad
+    from transcriptomic_clustering.clustering import cluster_louvain
+    rng = np.random.default_rng(0)
+    for n in (8, 15, 29):
+        X = rng.normal(0, 1, (n, 10)).astype(np.float32)
+        adata = ad.AnnData(X, obs=pd.DataFrame(index=[f"c{i}" for i in range(n)]))
+        for method in ('annoy', 'pynndescent'):
+            _, obs_by_cluster, _, _ = cluster_louvain(
+                adata, k=15, knn_method=method, weighting_method='jaccard_snn',
+                louvain_method='vtraag', resolution=1.0, n_jobs=1, annoy_seed=1)
+            assert sum(len(v) for v in obs_by_cluster.values()) == n, (
+                f"{method} lost cells at n={n}")
+
+
+def test_pynndescent_clamps_n_jobs_to_numba_thread_cap():
+    """
+    pynndescent calls numba.set_num_threads(n_jobs), which raises above NUMBA_NUM_THREADS. The annoy
+    backend uses a multiprocessing Pool with no such ceiling, so the same n_jobs that works there
+    must not abort here.
+    """
+    pytest.importorskip("pynndescent")
+    import anndata as ad
+    from transcriptomic_clustering.clustering import cluster_louvain
+    rng = np.random.default_rng(0)
+    X = np.vstack([rng.normal(m, 0.4, (60, 8)) for m in (0, 5)]).astype(np.float32)
+    adata = ad.AnnData(X, obs=pd.DataFrame(index=[f"c{i}" for i in range(120)]))
+    _, obs_by_cluster, _, _ = cluster_louvain(
+        adata, k=15, knn_method='pynndescent', weighting_method='jaccard_snn',
+        louvain_method='vtraag', resolution=1.0, n_jobs=512, annoy_seed=1)
+    assert sum(len(v) for v in obs_by_cluster.values()) == 120

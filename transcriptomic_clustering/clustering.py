@@ -1,5 +1,6 @@
 import os
 import functools
+import warnings
 from datetime import datetime
 import annoy
 import community as community_louvain
@@ -10,7 +11,7 @@ import numpy as np
 import leidenalg
 from annoy import AnnoyIndex
 from scanpy import AnnData
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, issparse
 from math import log
 import tempfile
 from typing import List
@@ -122,7 +123,10 @@ def cluster_louvain(
               all scanpy pheongraph outputs are returned.
     nn_measure: metric to use for nearest neighbor evaluation. Can be "angular",
                 "euclidean", "manhattan", "hamming", or "dot"
-    knn_method: KNN method to use, currently can only be "annoy"
+    knn_method: KNN backend. "annoy" (default) matches scrattch.bigcat's BiocNeighbors::buildAnnoy:
+                a random-projection forest, memory-mapped so it never has to hold the graph in RAM.
+                "pynndescent" uses NN-descent, which refines an approximate graph iteratively and is
+                usually more accurate for the same k but builds entirely in memory.
     louvain_method: Louvain method to use, currently can only be "taynaud"
     weighting_method: weighting method to use to use for nearest neighbors graph
                       Can currently be "jaccard" or "uniform".
@@ -153,8 +157,19 @@ def cluster_louvain(
             graph_filename = graph_filename,
             random_seed = annoy_seed   # FIXED annoy seed (decoupled from clustering seed) -> seed-invariant KNN graph, like R
         )
+    elif knn_method == 'pynndescent':
+        nn_adata = get_pynndescent_knn(
+            adata = adata,
+            k = k,
+            nn_measure = nn_measure,
+            weighting_method = weighting_method,
+            n_jobs = n_jobs,
+            graph_filename = graph_filename,
+            random_seed = annoy_seed   # same fixed seed slot, so the KNN graph stays seed-invariant
+        )
     else:
-        raise ValueError(f"{knn_method} is not a valid knn method! Only available method is annoy")
+        raise ValueError(f"{knn_method} is not a valid knn method! "
+                         f"Choose 'annoy' (default, matches scrattch.bigcat) or 'pynndescent'.")
 
     # Match scrattch.bigcat jaccard_big: prune weak jaccard edges (keep weight > prune),
     # but ONLY for large graphs (n > bin_size=50000), which is where R's nbin>1 branch prunes.
@@ -375,6 +390,109 @@ def _annoy_build_csr_nn_graph(
         return _uniform_csr_from_nn_dict(graph_map)
     else:
         raise ValueError(f"{weighting_method} is not a valid weighting option! Must use jaccard, jaccard_snn or uniform")
+
+def get_pynndescent_knn(
+    adata: AnnData,
+    k: int,
+    nn_measure: str = 'euclidean',
+    weighting_method: str = 'jaccard',
+    n_jobs: int = 1,
+    graph_filename: str = None,
+    random_seed: int = None
+):
+    """
+    K nearest neighbors via pynndescent (NN-descent), as an alternative to the annoy backend.
+
+    Produces exactly the same {index: neighbour list} structure annoy's path does -- k neighbours
+    per cell, self included -- so the graph weighting (jaccard / jaccard_snn / uniform) and
+    everything downstream is shared and unchanged.
+
+    Where the two differ: annoy builds a random-projection forest and never refines it, and can be
+    memory-mapped from disk; NN-descent starts from a random graph and iteratively improves it, so
+    it is usually more accurate at the same k but holds everything in memory. See
+    reports/knn_backends.md.
+
+    Parameters
+    -----------
+    adata: an AnnData of data to cluster
+    k: number of nearest neighbors to find (self included, matching the annoy path)
+    nn_measure: distance metric; annoy's "angular" is mapped to pynndescent's "cosine"
+    weighting_method: "jaccard", "jaccard_snn" or "uniform"
+    n_jobs: number of threads for index construction and querying
+    graph_filename: File to store KNN graph AnnData in, if unset does not save graph
+    random_seed: seed for NN-descent's random initialisation, for a reproducible graph
+
+    Returns
+    -----------
+    nn_adata: An AnnData object with a weighted nearest neighbor graph of the observations
+    """
+    try:
+        from pynndescent import NNDescent
+    except ImportError as err:
+        raise ImportError("knn_method='pynndescent' requires pynndescent "
+                          "(pip install pynndescent).") from err
+
+    # pynndescent calls numba.set_num_threads(n_jobs), and numba raises if n_jobs exceeds
+    # NUMBA_NUM_THREADS (fixed at import from the detected core count). The annoy backend uses a
+    # multiprocessing Pool and has no such limit, so the same n_jobs that is fine there would abort
+    # here -- clamp instead of making the caller special-case the backend.
+    try:
+        import numba
+        max_threads = int(numba.config.NUMBA_NUM_THREADS)
+        if n_jobs > max_threads:
+            warnings.warn(f"pynndescent: n_jobs={n_jobs} exceeds numba's thread cap "
+                          f"({max_threads}); using {max_threads}")
+            n_jobs = max_threads
+    except ImportError:
+        pass
+    n_jobs = max(1, n_jobs)
+
+    data_matrix = adata.X
+    if issparse(data_matrix):
+        data_matrix = data_matrix.toarray()
+    data_matrix = np.asarray(data_matrix, dtype=np.float32)
+
+    # annoy metric names -> pynndescent metric names
+    metric = {'angular': 'cosine', 'dot': 'dot'}.get(nn_measure, nn_measure)
+
+    # The recursive pipeline drills down to very small subsets, where k can exceed the number of
+    # points. annoy silently returns min(k, n) neighbours; pynndescent needs n_neighbors <= n.
+    n_obs = data_matrix.shape[0]
+    k_eff = max(2, min(k, n_obs))
+
+    index = NNDescent(
+        data_matrix,
+        n_neighbors=k_eff,
+        metric=metric,
+        random_state=random_seed,
+        n_jobs=n_jobs,
+    )
+    neighbors, _ = index.neighbor_graph          # (n, k_eff) -- includes the point itself
+
+    # pynndescent pads unfilled slots with -1 (it happens on small or sparsely-connected subsets).
+    # Those would reach csr_matrix as negative indices and abort graph construction, so fold them
+    # onto the point itself -- which is what annoy effectively yields and leaves the fixed-width
+    # Jaccard/SNN construction downstream valid.
+    if (neighbors < 0).any():
+        neighbors = np.where(neighbors < 0, np.arange(n_obs, dtype=neighbors.dtype)[:, None],
+                             neighbors)
+    graph_map = {i: list(map(int, neighbors[i])) for i in range(neighbors.shape[0])}
+
+    if weighting_method == 'jaccard':
+        csr_graph = _jaccard_csr_from_nn_dict(graph_map, n_jobs)
+    elif weighting_method == 'jaccard_snn':
+        csr_graph = _jaccard_snn_csr_from_nn_dict(graph_map)
+    elif weighting_method == 'uniform':
+        csr_graph = _uniform_csr_from_nn_dict(graph_map)
+    else:
+        raise ValueError(f"{weighting_method} is not a valid weighting option! "
+                         f"Must use jaccard, jaccard_snn or uniform")
+
+    graph_adata = AnnData(csr_graph, obs=adata.obs, var=adata.obs)
+    if graph_filename:
+        graph_adata.write(graph_filename)
+    return graph_adata
+
 
 def get_annoy_knn(
     adata: AnnData,
