@@ -1,301 +1,18 @@
 """
 Post-clustering QC — Python port of scrattch.bigcat's post-clustering qc functions and scripts.
 
-Provides:
-  - create_pairs / get_pairs         : cluster-pair enumeration / parsing
-  - de_all_pairs                     : exhaustive all-pairs DE (summary + per-gene detail)
+Consumes the output of `de_all_pairs` (see de_all_pairs.py) to flag suspect clusters:
   - find_doublet_by_marker           : flag clusters expressing markers of >1 cell type
   - find_low_quality                 : flag clusters that are low-quality versions of another
   - find_triplets / check_triplet /
     find_doublets                    : doublet detection by the "triplet" (A+B -> C) method
-
-DE uses the same eBayes moderated-t as the merge step (de_ebayes), so scores are consistent.
 """
-from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
-import itertools
-import json
-import os
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import pandas as pd
-from scipy import stats
-from statsmodels.stats.multitest import multipletests
 
-from .de_ebayes import get_linear_fit_vals, moderate_variances
-from .diff_expression import get_qdiff, filter_gene_stats
-
-# thresholds consumed by filter_gene_stats (the "de" thresholds); score_thresh/min_genes/low_thresh
-# are NOT filter args and are dropped before filtering (matching merge_clusters_by_de).
-_FILTER_KEYS = ('q1_thresh', 'q2_thresh', 'cluster_size_thresh', 'qdiff_thresh', 'padj_thresh', 'lfc_thresh')
-
-SCORE_CAP = 20.0   # per-gene -log10(padj) cap (matches scrattch de_stats_pair / calc_de_score)
-
-
-def create_pairs(cluster_labels) -> List[Tuple[str, str]]:
-    """All nondirectional cluster pairs (P1<P2, self excluded). Mirrors R create_pairs."""
-    labs = sorted({str(c) for c in cluster_labels})
-    return [(a, b) for a, b in itertools.combinations(labs, 2)]
-
-
-def get_pairs(pair_strs) -> pd.DataFrame:
-    """Parse 'P1_P2' strings -> DataFrame(P1, P2) indexed by the string. Mirrors R get_pairs."""
-    rows = [s.split('_', 1) for s in pair_strs]
-    df = pd.DataFrame(rows, columns=['P1', 'P2'], index=list(pair_strs))
-    return df
-
-
-def _logpval(padj: np.ndarray) -> np.ndarray:
-    with np.errstate(divide='ignore'):
-        lp = -np.log10(padj.astype(float))
-    return np.minimum(lp, SCORE_CAP)
-
-
-def make_cl_bin(clusters, bin_size: int = 100) -> Dict[str, int]:
-    """
-    Assign clusters to bins, mirroring scrattch.bigcat's
-    `cl.bin = data.frame(cl=cn, bin=ceiling((1:length(cn)/cl.bin.size)))`.
-
-    Clusters are sorted numerically when every label is integer-like, otherwise lexicographically,
-    then chopped into consecutive groups of `bin_size` (bins are 1-based, as in R).
-    """
-    labels = [str(c) for c in clusters]
-    try:
-        order = sorted(labels, key=int)
-    except ValueError:
-        order = sorted(labels)
-    return {c: i // bin_size + 1 for i, c in enumerate(order)}
-
-
-def _bin_pair(a, b, cl_bin: Dict[str, int]) -> Tuple[int, int]:
-    """Bin-pair a cluster pair belongs to, ordered bin.x <= bin.y (R writes the upper triangle only)."""
-    bx, by = cl_bin[str(a)], cl_bin[str(b)]
-    return (bx, by) if bx <= by else (by, bx)
-
-
-def _partition_path(root: str, bin_x: int, bin_y: int) -> str:
-    """Hive-style partition directory, matching R's file.path(out.dir, "bin.x=X", "bin.y=Y")."""
-    return os.path.join(root, f"bin.x={bin_x}", f"bin.y={bin_y}")
-
-
-def _write_partition(df: pd.DataFrame, root: str, bin_x: int, bin_y: int) -> None:
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ImportError as err:
-        raise ImportError(
-            "Writing binned DE results requires pyarrow (pip install pyarrow). "
-            "Omit out_dir/summary_dir to keep results in memory instead."
-        ) from err
-    d = _partition_path(root, bin_x, bin_y)
-    os.makedirs(d, exist_ok=True)
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False),
-                   os.path.join(d, "part-0.parquet"))
-
-
-def _save_cl_bin(root: str, cl_bin: Dict[str, int]) -> None:
-    """Store cl_bin beside the dataset so readers can map pairs to partitions without it being passed."""
-    os.makedirs(root, exist_ok=True)
-    with open(os.path.join(root, "_cl_bin.json"), "w") as f:
-        json.dump({str(k): int(v) for k, v in cl_bin.items()}, f)
-
-
-def load_cl_bin(root: str) -> Dict[str, int]:
-    """Load the cl_bin mapping saved next to a binned DE dataset."""
-    with open(os.path.join(root, "_cl_bin.json")) as f:
-        return json.load(f)
-
-
-def read_de_pairs(root: str,
-                  pairs: Optional[List[Tuple[Any, Any]]] = None,
-                  cl_bin: Optional[Dict[str, int]] = None,
-                  columns: Optional[List[str]] = None) -> pd.DataFrame:
-    """
-    Read DE rows for specific cluster pairs from a binned dataset written by `de_all_pairs`.
-
-    Only the partitions those pairs live in are opened -- the whole point of the bin layout.
-    Works for both the detail (out_dir) and summary (summary_dir) datasets.
-
-    Parameters
-    ----------
-    root: dataset directory written by de_all_pairs
-    pairs: cluster pairs to fetch; None reads the entire dataset
-    cl_bin: cluster -> bin map; read from `root/_cl_bin.json` when omitted
-    columns: subset of columns to read
-
-    Returns
-    -------
-    DataFrame of the matching rows (empty if none of the pairs are present)
-    """
-    try:
-        import pyarrow.dataset as pads
-    except ImportError as err:
-        raise ImportError("Reading binned DE results requires pyarrow (pip install pyarrow).") from err
-
-    if pairs is None:
-        ds = pads.dataset(root, format="parquet", partitioning="hive")
-        return ds.to_table(columns=columns).to_pandas()
-
-    if cl_bin is None:
-        cl_bin = load_cl_bin(root)
-    pairs = [(str(a), str(b)) for a, b in pairs]
-    wanted = {f"{a}_{b}" for a, b in pairs} | {f"{b}_{a}" for a, b in pairs}
-
-    # map the requested pairs to their partitions and open only those
-    parts = sorted({_partition_path(root, *_bin_pair(a, b, cl_bin)) for a, b in pairs})
-    files = [os.path.join(d, f) for d in parts if os.path.isdir(d)
-             for f in sorted(os.listdir(d)) if f.endswith(".parquet")]
-    if not files:
-        return pd.DataFrame(columns=columns or [])
-    df = pads.dataset(files, format="parquet").to_table(columns=columns).to_pandas()
-    return df[df["pair"].isin(wanted)].reset_index(drop=True)
-
-
-def _de_one_pair(a, b, cluster_means, present_cluster_means, cl_size, genes, sqrt_sigma,
-                 stdev_unscaled, df, df_prior, df_pooled, filt, padj_alpha, top_n, want_detail):
-    """eBayes DE for a single cluster pair -> (summary row, detail frame or None)."""
-    means_diff = (cluster_means.loc[a] - cluster_means.loc[b]).to_frame()
-    stdev_comb = np.sqrt(np.sum(stdev_unscaled.loc[[a, b]] ** 2))[0]
-    df_total = min(df + df_prior, df_pooled)
-    t_vals = means_diff / sqrt_sigma / stdev_comb
-    p_vals = 2 * stats.t.sf(np.abs(t_vals[0]), df_total)
-    _, p_adj, _, _ = multipletests(p_vals, alpha=padj_alpha, method='holm')
-
-    s = pd.DataFrame(index=genes)
-    s['p_value'] = p_vals; s['p_adj'] = p_adj; s['lfc'] = means_diff.values
-    s['q1'] = present_cluster_means.loc[a].values
-    s['q2'] = present_cluster_means.loc[b].values
-    s['qdiff'] = get_qdiff(present_cluster_means.loc[a].values, present_cluster_means.loc[b].values)
-
-    up = filter_gene_stats(s, 'up-regulated', cl1_size=cl_size[a], cl2_size=cl_size[b], **filt)
-    down = filter_gene_stats(s, 'down-regulated', cl1_size=cl_size[a], cl2_size=cl_size[b], **filt)
-    up = up.sort_values('p_adj'); down = down.sort_values('p_adj')
-    up_lp = _logpval(up['p_adj'].to_numpy()); down_lp = _logpval(down['p_adj'].to_numpy())
-
-    summ_row = {
-        'pair': f"{a}_{b}", 'P1': a, 'P2': b,
-        'up_num': len(up), 'down_num': len(down), 'num': len(up) + len(down),
-        'up_score': float(up_lp.sum()), 'down_score': float(down_lp.sum()),
-        'score': float(up_lp.sum() + down_lp.sum()),
-    }
-    if not want_detail:
-        return summ_row, None
-
-    uh, dh = up.head(top_n), down.head(top_n)
-    uh_lp, dh_lp = up_lp[:len(uh)], down_lp[:len(dh)]
-    d = pd.DataFrame({
-        'pair': f"{a}_{b}", 'P1': a, 'P2': b,
-        'gene': list(uh.index) + list(dh.index),
-        'logPval': np.concatenate([uh_lp, dh_lp]),
-        'sign': ['up'] * len(uh) + ['down'] * len(dh),
-        'rank': list(range(1, len(uh) + 1)) + list(range(1, len(dh) + 1)),
-        'lfc': np.abs(np.concatenate([uh['lfc'].to_numpy(), dh['lfc'].to_numpy()])),
-    })
-    return summ_row, (d if len(d) else None)
-
-
-def de_all_pairs(
-        cluster_means: pd.DataFrame,     # clusters x genes (normalized)
-        cluster_variances: pd.DataFrame, # clusters x genes
-        present_cluster_means: pd.DataFrame,
-        cl_size: Dict[Any, int],
-        thresholds: Dict[str, Any],
-        pairs: Optional[List[Tuple[Any, Any]]] = None,
-        top_n: int = 500,
-        return_detail: bool = True,
-        out_dir: Optional[str] = None,
-        summary_dir: Optional[str] = None,
-        cl_bin: Optional[Dict[str, int]] = None,
-        bin_size: int = 100,
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """
-    Compute eBayes DE for ALL (or given) cluster pairs. Mirrors scrattch.bigcat de_all_pairs
-    (+ its de_summary / de_parquet outputs).
-
-    With `out_dir` / `summary_dir`, results stream to disk in scrattch.bigcat's binned layout --
-    clusters are assigned to bins of `bin_size` and each bin-pair is written to
-    `<dir>/bin.x=X/bin.y=Y/part-0.parquet` -- so an all-pairs run never holds every pair in memory
-    and any pair can be read back later with `read_de_pairs` by opening only its partition.
-    `_cl_bin.json` is saved alongside so readers are self-contained. Requires pyarrow.
-
-    Parameters
-    ----------
-    pairs: pairs to test; None enumerates all pairs of cluster_means.index
-    top_n: detail genes kept per direction per pair (R de_selected_pairs default: 500)
-    return_detail: build the per-gene detail (ignored for a dataset already written to out_dir)
-    out_dir / summary_dir: write detail / summary as binned parquet instead of returning them
-    cl_bin: cluster -> bin map; built from `bin_size` when omitted
-    bin_size: clusters per bin (R cl.bin.size default: 100)
-
-    Returns
-    -------
-    summary : DataFrame [pair, P1, P2, up_num, down_num, num, up_score, down_score, score],
-              or None when written to `summary_dir`
-    detail  : DataFrame [pair, P1, P2, gene, logPval, sign, rank, lfc], or None when written to
-              `out_dir` or when return_detail=False. `sign` = 'up' means higher in P1.
-    """
-    if pairs is None:
-        pairs = create_pairs(cluster_means.index)
-    pairs = [(str(a), str(b)) for a, b in pairs]
-    filt = {k: thresholds.get(k) for k in _FILTER_KEYS}
-
-    # eBayes fit ONCE across all clusters (same as de_pairs_ebayes)
-    sigma_sq, df, stdev_unscaled = get_linear_fit_vals(cluster_variances, cl_size)
-    sigma_sq_post, _var_prior, df_prior = moderate_variances(sigma_sq, df)
-    df_pooled = np.sum(df)
-    sqrt_sigma = np.sqrt(sigma_sq_post)
-    genes = cluster_means.columns
-    padj_alpha = thresholds['padj_thresh']
-
-    def _run(a, b, want_detail):
-        return _de_one_pair(a, b, cluster_means, present_cluster_means, cl_size, genes, sqrt_sigma,
-                            stdev_unscaled, df, df_prior, df_pooled, filt, padj_alpha,
-                            top_n, want_detail)
-
-    to_disk = out_dir is not None or summary_dir is not None
-    if not to_disk:
-        summ_rows, detail_frames = [], []
-        for a, b in pairs:
-            row, d = _run(a, b, return_detail)
-            summ_rows.append(row)
-            if d is not None:
-                detail_frames.append(d)
-        summary = pd.DataFrame(summ_rows)
-        detail = pd.concat(detail_frames, ignore_index=True) if (return_detail and detail_frames) else \
-            (pd.DataFrame(columns=['pair', 'P1', 'P2', 'gene', 'logPval', 'sign', 'rank', 'lfc'])
-             if return_detail else None)
-        return summary, detail
-
-    # --- binned, streamed to disk: one partition per bin-pair, nothing accumulated across bins ---
-    if cl_bin is None:
-        cl_bin = make_cl_bin(cluster_means.index, bin_size=bin_size)
-    for root in (out_dir, summary_dir):
-        if root is not None:
-            _save_cl_bin(root, cl_bin)
-
-    by_bin: Dict[Tuple[int, int], List[Tuple[str, str]]] = defaultdict(list)
-    for a, b in pairs:
-        by_bin[_bin_pair(a, b, cl_bin)].append((a, b))
-
-    want_detail = out_dir is not None and return_detail
-    kept_summary: List[Dict[str, Any]] = []
-    for (bx, by), bin_pairs in sorted(by_bin.items()):
-        rows, frames = [], []
-        for a, b in bin_pairs:
-            row, d = _run(a, b, want_detail)
-            rows.append(row)
-            if d is not None:
-                frames.append(d)
-        if out_dir is not None and frames:
-            _write_partition(pd.concat(frames, ignore_index=True), out_dir, bx, by)
-        if summary_dir is not None:
-            _write_partition(pd.DataFrame(rows), summary_dir, bx, by)
-        else:
-            kept_summary.extend(rows)
-        del rows, frames
-
-    summary = None if summary_dir is not None else pd.DataFrame(kept_summary)
-    return summary, None
-
+from .de_all_pairs import SCORE_CAP
 
 def find_doublet_by_marker(cluster_means: pd.DataFrame, markers: Dict[str, List[str]], th: float = 3.5) -> pd.DataFrame:
     """
@@ -327,14 +44,44 @@ def find_low_quality(summary: pd.DataFrame, low_th: int = 2) -> pd.DataFrame:
 
 
 def find_triplets(summary: pd.DataFrame, min_up_num: int = 30, max_down_num: int = 10,
-                  min_de_num: int = 50) -> pd.DataFrame:
+                  min_de_num: int = 50, all_pairs=None, select_cl=None) -> pd.DataFrame:
     """
     Enumerate candidate doublet triplets (cl_up ~ doublet of cl_down_x + cl_down_y).
-    Mirrors R find_triplets_big. `summary` is the de_all_pairs summary.
+    Mirrors R `find_triplets_big`.
+
+    A doublet looks *asymmetric* against each of its parents: many genes up in it, almost none down.
+    So keep the strongly asymmetric pairs, orient each so `cl_up` is the richer side, keep clusters
+    that are the richer side against more than one partner, and pair those partners up. The two
+    parents must themselves be well separated (`min_de_num` DE genes in both directions), otherwise
+    the "doublet" is just one cluster split in two.
+
+    Parameters
+    ----------
+    summary: the de_all_pairs summary
+    min_up_num / max_down_num: asymmetry thresholds (R min.up.num / max.down.num)
+    min_de_num: how separated the two parents must be (R min.de.num)
+    all_pairs: optional restriction to a set of pairs -- a DataFrame with a `pair` column or an
+        iterable of pair strings (R `all.pairs`)
+    select_cl: optional restriction to clusters (R `select.cl`)
+
+    Returns
+    -------
+    DataFrame [cl_up, cl_down_x, cl_down_y, up_num_x, down_num_x, up_num_y, down_num_y, P1, P2,
+    pair, pair1, pair2], sorted by cl_up then by down_num_x + down_num_y ascending -- so for each
+    candidate the most convincing triplet (fewest down genes) comes first. `find_doublets` stops at
+    the first triplet that passes, so this order decides which one is reported.
     """
     s = summary
     asym = s[((s.up_num > min_up_num) & (s.down_num < max_down_num) & (s.up_num - s.down_num > min_up_num)) |
              ((s.down_num > min_up_num) & (s.up_num < max_down_num) & (s.down_num - s.up_num > min_up_num))].copy()
+
+    if all_pairs is not None:
+        keep = set(all_pairs['pair']) if isinstance(all_pairs, pd.DataFrame) else set(all_pairs)
+        asym = asym[asym['pair'].isin(keep)]
+    if select_cl is not None:
+        sel = {str(c) for c in select_cl}
+        asym = asym[asym.P1.astype(str).isin(sel) & asym.P2.astype(str).isin(sel)]
+
     up_bigger = asym.up_num > asym.down_num
     asym['cl_up'] = np.where(up_bigger, asym.P1, asym.P2)
     asym['cl_down'] = np.where(up_bigger, asym.P2, asym.P1)
@@ -348,24 +95,53 @@ def find_triplets(summary: pd.DataFrame, min_up_num: int = 30, max_down_num: int
     t = asym[['cl_up', 'cl_down', 'up_num_o', 'down_num_o']]
     trip = t.merge(t, on='cl_up', suffixes=('_x', '_y'))
     trip = trip[trip.cl_down_x != trip.cl_down_y].copy()
+    # R renames up.num.new.* back to up.num.* here; do the same for all four (R's rename list has a
+    # typo that leaves up.num.new.y untouched -- not reproduced).
+    trip = trip.rename(columns={'up_num_o_x': 'up_num_x', 'down_num_o_x': 'down_num_x',
+                                'up_num_o_y': 'up_num_y', 'down_num_o_y': 'down_num_y'})
+
     trip['P1'] = np.minimum(trip.cl_down_x, trip.cl_down_y)
     trip['P2'] = np.maximum(trip.cl_down_x, trip.cl_down_y)
     trip['pair'] = trip.P1.astype(str) + '_' + trip.P2.astype(str)
+    if all_pairs is not None:
+        keep = set(all_pairs['pair']) if isinstance(all_pairs, pd.DataFrame) else set(all_pairs)
+        trip = trip[trip['pair'].isin(keep)]
     # the two parents must be genuinely different from each other (both directions have many DE genes)
     diff_pairs = set(s[(s.up_num > min_de_num) & (s.down_num > min_de_num)]['pair'])
     trip = trip[trip['pair'].isin(diff_pairs)]
-    trip = trip.sort_values(['cl_up']).reset_index(drop=True)
+
+    # the cl_up-vs-parent pair keys, canonical (lexicographic) like every other `pair` in the dataset
+    def _canon(a, b):
+        a = a.astype(str); b = b.astype(str)
+        return np.where(a < b, a + '_' + b, b + '_' + a)
+    trip['pair1'] = _canon(trip.cl_up, trip.cl_down_x)
+    trip['pair2'] = _canon(trip.cl_up, trip.cl_down_y)
+
+    # R: arrange(cl.up, down.num.x + down.num.y) -- fewest down genes first
+    trip = trip.assign(_ord=trip.down_num_x + trip.down_num_y)
+    trip = trip.sort_values(['cl_up', '_ord']).drop(columns='_ord').reset_index(drop=True)
     return trip
 
 
-def _dir_genes(detail_by_pair: Dict[str, pd.DataFrame], c1: str, c2: str, top_n: int) -> Dict[str, float]:
-    """Genes higher in c1 than c2 (logPval), rank<=top_n. Uses stored P1<P2 + sign column."""
+def _dir_genes(detail_by_pair: Dict[str, pd.DataFrame], c1: str, c2: str,
+               top_n: Optional[int] = None) -> Dict[str, float]:
+    """
+    Genes higher in c1 than c2 (logPval), rank<=top_n.
+
+    Direction lives in P1, as in scrattch.bigcat: rows with P1 == c1 are exactly the genes up in c1.
+    `pair` stays canonical, so the lookup key is still the lexicographically ordered label pair.
+
+    top_n=None applies no rank cap -- R's check_triplet_big deliberately takes ALL genes for the
+    two overlap sets while capping the four scored sets at top.n.
+    """
     a, b = (c1, c2) if c1 < c2 else (c2, c1)
-    want = 'up' if c1 < c2 else 'down'   # 'up' = higher in stored P1
     d = detail_by_pair.get(f"{a}_{b}")
     if d is None:
         return {}
-    d = d[(d['sign'] == want) & (d['rank'] <= top_n)]
+    m = (d['P1'].astype(str) == str(c1))
+    if top_n is not None:
+        m &= (d['rank'] <= top_n)
+    d = d[m]
     return dict(zip(d['gene'], d['logPval']))
 
 
@@ -382,10 +158,13 @@ def check_triplet(detail_by_pair: Dict[str, pd.DataFrame], cl_up: str, cl_x: str
     down_genes = _dir_genes(detail_by_pair, c2, c1, top_n) # higher in parent2 than parent1
     up_s, down_s = trunc(up_genes), trunc(down_genes)
 
-    # does the doublet (cl) inherit parent1's genes? -> overlap of (cl>c2) genes with (c1>c2) genes
-    cl_vs_c2 = set(_dir_genes(detail_by_pair, cl, c2, top_n).keys())
+    # Does the doublet (cl) inherit parent1's genes? -> overlap of (cl>c2) genes with (c1>c2) genes.
+    # NOTE: R does NOT cap these two sets at top.n (its `tmp.genes` has no rank filter) even though
+    # the four scored sets are capped. Capping them here would shrink the overlap and understate the
+    # ratios, so top_n is deliberately omitted.
+    cl_vs_c2 = set(_dir_genes(detail_by_pair, cl, c2).keys())
     ou1 = {g: v for g, v in up_genes.items() if g in cl_vs_c2};  ou1_s = trunc(ou1)
-    cl_vs_c1 = set(_dir_genes(detail_by_pair, cl, c1, top_n).keys())
+    cl_vs_c1 = set(_dir_genes(detail_by_pair, cl, c1).keys())
     od1 = {g: v for g, v in down_genes.items() if g in cl_vs_c1}; od1_s = trunc(od1)
 
     up2 = _dir_genes(detail_by_pair, c1, cl, top_n); up2_s = trunc(up2)
@@ -407,24 +186,55 @@ def check_triplet(detail_by_pair: Dict[str, pd.DataFrame], cl_up: str, cl_x: str
     }
 
 
-def find_doublets(detail: pd.DataFrame, triplets: pd.DataFrame, top_n: int = 50,
-                  score_th: float = 0.8, olap_th: float = 1.6) -> pd.DataFrame:
+def find_doublets(detail: Optional[pd.DataFrame], triplets: pd.DataFrame, top_n: int = 50,
+                  score_th: float = 0.8, olap_th: float = 1.6,
+                  root: Optional[str] = None, cl_bin: Optional[Dict[str, int]] = None) -> pd.DataFrame:
     """
-    For each candidate cl_up, test its triplets; record the first that looks like a doublet
-    (score>score_th and olap_ratio_up_1+olap_ratio_down_1 > olap_th). Mirrors find_doublets_all_big.
-    Returns one row per candidate that scores best (all candidates' best result).
+    Score every candidate's triplets and return the results. Mirrors R `find_doublets_all_big`.
+
+    For each `cl_up`, triplets are tested in the order `find_triplets` produced (fewest down genes
+    first) and testing STOPS at the first triplet with `score > score_th` and
+    `olap_ratio_up_1 + olap_ratio_down_1 > olap_th`.
+
+    **Every tested triplet is returned**, not just the winner -- R writes them all and the caller
+    filters afterwards, often at a looser threshold than the early-stop one (the reference workflow
+    stops at olap 1.6 but selects at 1.4). Returning only the best row would hide those.
+
+    Parameters
+    ----------
+    detail: the per-gene detail as a DataFrame; pass None to stream from `root` instead
+    triplets: output of find_triplets
+    root: de_parquet directory -- when given, each triplet's rows are read from the partitions of
+        its three clusters instead of holding the whole detail in memory (what R does, and what
+        makes this usable on a large taxonomy)
+    cl_bin: cluster -> bin map, needed with `root`
+
+    Returns
+    -------
+    DataFrame with one row per tested triplet: [cl, cl1, cl2, up_num, down_num, score,
+    olap_ratio_*, olap_num_*].
     """
-    detail_by_pair = {p: d for p, d in detail.groupby('pair')}
+    if detail is None and root is None:
+        raise ValueError("pass either `detail` or `root`")
+    from .de_all_pairs import read_de_pairs
+
+    by_pair_all = None
+    if detail is not None:
+        by_pair_all = {p: d for p, d in detail.groupby('pair')}
+
     results = []
-    for cl_up, tg in triplets.groupby('cl_up'):
-        best = None
+    for cl_up, tg in triplets.groupby('cl_up', sort=False):
         for _, row in tg.iterrows():
-            r = check_triplet(detail_by_pair, cl_up, row['cl_down_x'], row['cl_down_y'], top_n=top_n)
-            if best is None or r['score'] > best['score']:
-                best = r
+            c1, c2 = row['cl_down_x'], row['cl_down_y']
+            if by_pair_all is not None:
+                by_pair = by_pair_all
+            else:
+                trio = [str(cl_up), str(c1), str(c2)]
+                d = read_de_pairs(root, pairs=[(a, b) for i, a in enumerate(trio)
+                                               for b in trio[i + 1:]], cl_bin=cl_bin)
+                by_pair = {p: g for p, g in d.groupby('pair')} if len(d) else {}
+            r = check_triplet(by_pair, cl_up, c1, c2, top_n=top_n)
+            results.append(r)
             if r['score'] > score_th and (r['olap_ratio_up_1'] + r['olap_ratio_down_1']) > olap_th:
-                best = r
                 break
-        if best is not None:
-            results.append(best)
     return pd.DataFrame(results)

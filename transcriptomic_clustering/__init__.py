@@ -31,7 +31,12 @@ from .merging import merge_clusters
 from .diff_expression import de_pairs_chisq, vec_chisq_test
 from .de_ebayes import de_pairs_ebayes, de_pairs_ebayes_parallel
 from .final_merging import final_merge
+from .de_all_pairs import (
+    check_pairs_ds, check_pairs_lfc, create_pairs, de_all_pairs, get_gene_score_ds, get_pairs,
+    load_cl_bin, make_cl_bin, read_de_pairs, select_markers_pair_direction_ds,
+    select_markers_pair_group_ds, select_markers_pair_group_top_ds, select_pos_markers_ds,
+    select_top_pos_markers_ds,
+)
 from .post_clustering_qc import (
-    de_all_pairs, find_doublet_by_marker, find_low_quality, find_triplets, find_doublets,
-    make_cl_bin, read_de_pairs, load_cl_bin,
+    check_triplet, find_doublet_by_marker, find_doublets, find_low_quality, find_triplets,
 )
