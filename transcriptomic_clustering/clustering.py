@@ -98,7 +98,7 @@ def cluster_louvain(
     k: int=15,
     annotate: bool = False,
     nn_measure: str = 'euclidean',
-    knn_method: str = 'annoy',
+    knn_method: str = 'pynndescent',
     louvain_method: str = 'taynaud',
     weighting_method: str = 'jaccard',
     annoy_trees: int = None,
@@ -109,7 +109,8 @@ def cluster_louvain(
     random_seed: int = None,
     jaccard_prune: float = 0.05,
     jaccard_prune_min_size: int = 50000,
-    annoy_seed: int = 1
+    annoy_seed: int = None,
+    knn_seed: int = None
 ):
     """
     Cluster cells by building an approximate-KNN Jaccard/SNN graph and running
@@ -123,10 +124,16 @@ def cluster_louvain(
               all scanpy pheongraph outputs are returned.
     nn_measure: metric to use for nearest neighbor evaluation. Can be "angular",
                 "euclidean", "manhattan", "hamming", or "dot"
-    knn_method: KNN backend. "annoy" (default) matches scrattch.bigcat's BiocNeighbors::buildAnnoy:
-                a random-projection forest, memory-mapped so it never has to hold the graph in RAM.
-                "pynndescent" uses NN-descent, which refines an approximate graph iteratively and is
-                usually more accurate for the same k but builds entirely in memory.
+    knn_method: KNN backend.
+                "pynndescent" (default) uses NN-descent, which refines an approximate graph
+                iteratively. It agrees with scrattch.bigcat slightly better than annoy does
+                (ARI 0.840 vs 0.829 on the 428-cluster reference), is exactly reproducible at a fixed
+                seed, and is more stable across seeds (0.912 vs 0.875) -- but it builds the index
+                entirely in memory.
+                "annoy" matches scrattch.bigcat's BiocNeighbors::buildAnnoy: a random-projection
+                forest, memory-mapped so it never has to hold the index in RAM. Prefer it when the
+                dataset is too large to build in memory, or when byte-level comparability with
+                scrattch.bigcat matters. See reports/9_knn_backends.md.
     louvain_method: Louvain method to use, currently can only be "taynaud"
     weighting_method: weighting method to use to use for nearest neighbors graph
                       Can currently be "jaccard" or "uniform".
@@ -136,7 +143,13 @@ def cluster_louvain(
     resolution: Louvain resolution parameter, changes size of communities
     annoy_index_filename: File to store annoy index in, defaults to temp file
     graph_filename: File to store KNN graph AnnData in, if unset does not save graph
-    random_seed: int to use as random seed 
+    random_seed: int to use as random seed
+    knn_seed: seed for the KNN backend, held FIXED and decoupled from random_seed so the graph is
+              seed-invariant the way scrattch.bigcat's is (BiocNeighbors::buildAnnoy uses a fixed
+              internal seed that ignores set.seed). Applies to whichever backend is selected --
+              annoy's index seed, or pynndescent's random_state. Defaults to 1.
+    annoy_seed: deprecated alias for knn_seed, kept so existing configs keep working. It was named
+                for annoy but has always seeded whichever backend is in use.
 
     Returns
     -----------
@@ -145,6 +158,16 @@ def cluster_louvain(
     graph: the calculated adjacency graph on the adata
     q: the maximum modularity of the final clustering 
     """
+    # `annoy_seed` predates the pynndescent backend; it seeds whichever backend is selected, so the
+    # accurate name is `knn_seed`. The old name still works.
+    if annoy_seed is not None:
+        warnings.warn("annoy_seed is deprecated; use knn_seed. It seeds whichever KNN backend is "
+                      "selected, not only annoy.", DeprecationWarning, stacklevel=2)
+        if knn_seed is None:
+            knn_seed = annoy_seed
+    if knn_seed is None:
+        knn_seed = 1
+
     if knn_method == 'annoy':
         nn_adata = get_annoy_knn(
             adata = adata,
@@ -155,7 +178,7 @@ def cluster_louvain(
             n_jobs = n_jobs,
             annoy_index_filename = annoy_index_filename,
             graph_filename = graph_filename,
-            random_seed = annoy_seed   # FIXED annoy seed (decoupled from clustering seed) -> seed-invariant KNN graph, like R
+            random_seed = knn_seed     # FIXED, decoupled from the clustering seed -> seed-invariant KNN graph, like R
         )
     elif knn_method == 'pynndescent':
         nn_adata = get_pynndescent_knn(
@@ -165,7 +188,7 @@ def cluster_louvain(
             weighting_method = weighting_method,
             n_jobs = n_jobs,
             graph_filename = graph_filename,
-            random_seed = annoy_seed   # same fixed seed slot, so the KNN graph stays seed-invariant
+            random_seed = knn_seed     # same fixed seed slot, so the KNN graph stays seed-invariant
         )
     else:
         raise ValueError(f"{knn_method} is not a valid knn method! "
@@ -429,8 +452,9 @@ def get_pynndescent_knn(
     try:
         from pynndescent import NNDescent
     except ImportError as err:
-        raise ImportError("knn_method='pynndescent' requires pynndescent "
-                          "(pip install pynndescent).") from err
+        raise ImportError("pynndescent is not installed. It is the default KNN backend "
+                          "(pip install pynndescent); or pass knn_method='annoy' to use the "
+                          "memory-mapped annoy backend instead.") from err
 
     # pynndescent calls numba.set_num_threads(n_jobs), and numba raises if n_jobs exceeds
     # NUMBA_NUM_THREADS (fixed at import from the detected core count). The annoy backend uses a
@@ -524,7 +548,13 @@ def get_annoy_knn(
             Note that AnnoyIndex builds differently on different n_jobs values
     annoy_index_filename: File to store annoy index in, defaults to temp file
     graph_filename: File to store KNN graph AnnData in, if unset does not save graph
-    random_seed: int to use as random seed 
+    random_seed: int to use as random seed
+    knn_seed: seed for the KNN backend, held FIXED and decoupled from random_seed so the graph is
+              seed-invariant the way scrattch.bigcat's is (BiocNeighbors::buildAnnoy uses a fixed
+              internal seed that ignores set.seed). Applies to whichever backend is selected --
+              annoy's index seed, or pynndescent's random_state. Defaults to 1.
+    annoy_seed: deprecated alias for knn_seed, kept so existing configs keep working. It was named
+                for annoy but has always seeded whichever backend is in use.
 
     Returns
     -----------

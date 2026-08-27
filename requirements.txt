@@ -8,7 +8,8 @@ scikit-misc
 psutil
 Welford
 Phenograph
-annoy
+annoy                  # KNN backend: matches scrattch.bigcat, memory-mapped (knn_method='annoy')
+pynndescent            # KNN backend: DEFAULT (knn_method='pynndescent'), builds in memory
 networkx
 leidenalg==0.8.4
 python-louvain

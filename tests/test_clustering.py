@@ -203,7 +203,7 @@ def test_pynndescent_handles_subsets_smaller_than_k():
         for method in ('annoy', 'pynndescent'):
             _, obs_by_cluster, _, _ = cluster_louvain(
                 adata, k=15, knn_method=method, weighting_method='jaccard_snn',
-                louvain_method='vtraag', resolution=1.0, n_jobs=1, annoy_seed=1)
+                louvain_method='vtraag', resolution=1.0, n_jobs=1, knn_seed=1)
             assert sum(len(v) for v in obs_by_cluster.values()) == n, (
                 f"{method} lost cells at n={n}")
 
@@ -222,5 +222,48 @@ def test_pynndescent_clamps_n_jobs_to_numba_thread_cap():
     adata = ad.AnnData(X, obs=pd.DataFrame(index=[f"c{i}" for i in range(120)]))
     _, obs_by_cluster, _, _ = cluster_louvain(
         adata, k=15, knn_method='pynndescent', weighting_method='jaccard_snn',
-        louvain_method='vtraag', resolution=1.0, n_jobs=512, annoy_seed=1)
+        louvain_method='vtraag', resolution=1.0, n_jobs=512, knn_seed=1)
     assert sum(len(v) for v in obs_by_cluster.values()) == 120
+
+
+def test_default_knn_method_is_pynndescent():
+    """
+    The default backend is pynndescent: it agrees with scrattch.bigcat slightly better than annoy,
+    is exactly reproducible at a fixed seed, and is more stable across seeds. Pinned here because
+    changing it silently would change every downstream clustering result.
+    """
+    import inspect
+    from transcriptomic_clustering.clustering import cluster_louvain
+    assert inspect.signature(cluster_louvain).parameters['knn_method'].default == 'pynndescent'
+
+
+def test_annoy_seed_is_a_working_deprecated_alias_for_knn_seed():
+    """
+    `annoy_seed` predates the pynndescent backend and has always seeded whichever backend is in use,
+    so the accurate name is `knn_seed`. The old name must keep working -- existing pipeline configs
+    pass it -- but should warn, and must produce the identical graph.
+    """
+    pytest.importorskip("pynndescent")
+    import warnings as _w
+    import anndata as ad
+    from sklearn.metrics import adjusted_rand_score
+    from transcriptomic_clustering.clustering import cluster_louvain
+    rng = np.random.default_rng(0)
+    X = np.vstack([rng.normal(m, 0.4, (120, 10)) for m in (0, 5)]).astype(np.float32)
+    adata = ad.AnnData(X, obs=pd.DataFrame(index=[f"c{i}" for i in range(240)]))
+
+    def run(**kw):
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter("always")
+            cbo, _, _, _ = cluster_louvain(adata, k=15, weighting_method='jaccard_snn',
+                                           louvain_method='vtraag', resolution=1.0, n_jobs=1, **kw)
+            return cbo, [x for x in caught if issubclass(x.category, DeprecationWarning)]
+
+    new, warn_new = run(knn_seed=1)
+    old, warn_old = run(annoy_seed=1)
+    default, warn_default = run()
+
+    assert adjusted_rand_score(old, new) == 1.0, "the alias must give the identical graph"
+    assert adjusted_rand_score(default, new) == 1.0, "the default must still be seed 1"
+    assert len(warn_old) == 1, "passing annoy_seed should warn"
+    assert not warn_new and not warn_default, "knn_seed and the default must not warn"
