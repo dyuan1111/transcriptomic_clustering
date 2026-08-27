@@ -119,6 +119,30 @@ def final_merge(
         backward-compatible behavior: 'latent' if a latent_component is set, else 'pca'.
     rm_genes
         Genes to drop from marker_genes for the 'markers' space (e.g. sex/mito), matching R `rm.genes`.
+
+    Batch-aware merging
+    -------------------
+    `final_merge_kwargs.merge_clusters_kwargs` is forwarded verbatim to `merge_clusters`, so the
+    final merge is made batch-aware by adding `batch_aware_merging` to it -- the same key, and the
+    same meaning, as in the per-level `merge_clusters_kwargs` used by onestep/iter_clust:
+
+        merge_clusters_kwargs = {
+            'thresholds': {...},
+            'de_method': 'ebayes',                  # required in batch-aware mode
+            'batch_aware_merging': {
+                'batch_obs': 'platform',            # column of adata.obs naming each cell's batch
+                'lfc_conservation_th': 0.7,
+                'thresholds': {'10X_nuclei_v3': {'q1_thresh': 0.3}},  # optional per-batch overrides
+            },
+        }
+
+    Use it when cells come from several platforms or modalities and a pooled difference between two
+    clusters could be a platform artefact rather than biology. Note this makes only the *merge*
+    batch-aware; the reduced space that shortlists candidate pairs is unchanged, as in
+    scrattch.bigcat where the embedding never votes.
+
+    Requires an in-memory `adata` (per-batch statistics on a backed AnnData would take one full file
+    pass per batch).
     """
 
     obs_by_cluster = defaultdict(lambda: [])
@@ -126,6 +150,34 @@ def final_merge(
         obs_by_cluster[i] = cell_ids
     
     cluster_by_obs = _cluster_obs_dict_to_list(obs_by_cluster)
+
+    # Validate batch-aware options BEFORE building the reduced space. merge_clusters checks them too,
+    # but only once it is called -- by which point space='pca' has already paid for a full PCA and
+    # projection. A typo in batch_obs should not cost that.
+    _bam = final_merge_kwargs.merge_clusters_kwargs.get('batch_aware_merging')
+    if _bam is not None:
+        _batch_obs = _bam.get('batch_obs')
+        if _batch_obs is None:
+            raise ValueError(
+                "batch_aware_merging requires 'batch_obs', naming a column of adata.obs"
+            )
+        if _batch_obs not in adata.obs:
+            raise ValueError(
+                f"batch_aware_merging['batch_obs']={_batch_obs!r} is not a column of adata.obs. "
+                f"Available: {list(adata.obs.columns)}"
+            )
+        if adata.isbacked:
+            raise NotImplementedError(
+                "Batch-aware final merge requires an in-memory AnnData; the backed path would take "
+                "one full file pass per batch. Load the data into memory first."
+            )
+        _counts = adata.obs[_batch_obs].value_counts().to_dict()
+        logger.info(f'Final merge is BATCH-AWARE on obs[{_batch_obs!r}]: {_counts}')
+        if len(_counts) < 2:
+            logger.warning(
+                f'Only one batch present in obs[{_batch_obs!r}]; batch-aware merging degenerates to '
+                f'the pooled merge (nothing to cross-check a difference against).'
+            )
 
     # Choose the reduced space that feeds candidate-pair selection in merge_clusters (see docstring).
     if space is None:

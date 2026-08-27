@@ -26,7 +26,7 @@ from .projection import project, latent_project
 from .clustering import cluster_louvain, cluster_louvain_phenograph
 from .filter_known_modes import filter_known_modes
 from .hierarchical_sorting import hclust
-from .cluster_means import get_cluster_means
+from .cluster_means import get_cluster_means, get_cluster_means_per_batch
 from .merging import merge_clusters
 from .diff_expression import de_pairs_chisq, vec_chisq_test
 from .de_ebayes import de_pairs_ebayes, de_pairs_ebayes_parallel

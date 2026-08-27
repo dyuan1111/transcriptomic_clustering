@@ -114,6 +114,76 @@ def get_cluster_means_inmemory(
     return (cluster_means, present_cluster_means, cluster_variances)
 
 
+def get_cluster_means_per_batch(
+        adata: ad.AnnData,
+        cluster_assignments: Dict[Any, np.ndarray],
+        batch_by_obs: np.ndarray,
+        low_th: Optional[int]=1
+) -> Tuple[Dict[Any, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]], Dict[Any, Dict[Any, int]]]:
+    """
+    Compute cluster statistics separately within each batch.
+
+    Batch-aware merging asks every batch independently whether it can tell two clusters apart, so it
+    needs one set of statistics per batch rather than one pooled set. Mirrors scrattch.bigcat's
+    get_cl_stats_list.
+
+    A cluster contributes to a batch only if it has cells there, so the per-batch frames are indexed
+    by different (possibly smaller) sets of clusters. `sizes_by_batch` records the counts, including
+    clusters absent from a batch, which the merge rule needs in order to tell "no evidence" from
+    "evidence of similarity".
+
+    Parameters
+    ----------
+    adata:
+        AnnData with X matrix and annotations
+    cluster_assignments:
+        map of cluster label to cell idx belonging to cluster
+    batch_by_obs:
+        array of length n_obs giving each cell's batch
+    low_th:
+        minimum expression value used to filter for expressed genes
+
+    Returns
+    -------
+    stats_by_batch:
+        {batch: (cluster_means, present_cluster_means, cluster_variances)}, each clusters x genes
+    sizes_by_batch:
+        {batch: {cluster: n_cells}}, zero-filled for clusters with no cells in that batch
+    """
+    if adata.isbacked:
+        raise NotImplementedError(
+            "Batch-aware merging requires an in-memory AnnData. The backed path rescans every chunk "
+            "per call, so computing statistics per batch would take one full pass over the file per "
+            "batch. Load the data into memory first."
+        )
+
+    batch_by_obs = np.asarray(batch_by_obs)
+    if len(batch_by_obs) != adata.n_obs:
+        raise ValueError(
+            f"batch_by_obs has length {len(batch_by_obs)}, expected {adata.n_obs} (one per cell)"
+        )
+
+    stats_by_batch = {}
+    sizes_by_batch = {}
+    for batch in pd.unique(batch_by_obs):
+        in_batch = (batch_by_obs == batch)
+        # restrict each cluster to this batch's cells; keep the empties out of the frame but
+        # remember them, since "cluster absent here" is a meaningful state downstream
+        batch_assignments = {}
+        sizes = {}
+        for label, idx in cluster_assignments.items():
+            idx = np.asarray(idx)
+            kept = idx[in_batch[idx]]
+            sizes[label] = len(kept)
+            if len(kept) > 0:
+                batch_assignments[label] = kept
+        sizes_by_batch[batch] = sizes
+        if batch_assignments:
+            stats_by_batch[batch] = get_cluster_means_inmemory(adata, batch_assignments, low_th)
+
+    return stats_by_batch, sizes_by_batch
+
+
 def get_cluster_means_backed(
         adata: ad.AnnData,
         cluster_assignments: Dict[Any, np.ndarray],

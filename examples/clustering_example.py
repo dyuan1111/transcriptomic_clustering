@@ -54,7 +54,7 @@ def setup_transcriptomic_clustering():
     cluster_louvain_kwargs = { 
         'k': 15, 
         'nn_measure': 'euclidean',
-        'knn_method': 'annoy',
+        'knn_method': 'pynndescent',   # default; 'annoy' matches scrattch.bigcat and is memory-mapped
         'louvain_method': 'taynaud', 
         'weighting_method': 'jaccard',
         'n_jobs': 30, 
@@ -73,7 +73,20 @@ def setup_transcriptomic_clustering():
             'min_genes': 5
         },
         'k': 4,
-        'de_method': 'ebayes'
+        'de_method': 'ebayes',
+        # Multi-platform / multi-modality data only. Leave this out (the default) and clusters are
+        # merged on pooled statistics, which cannot tell a real difference from a platform artefact.
+        # Set it and each batch is tested separately: genes whose fold change flips direction between
+        # batches are discarded, and a pair merges only if no batch can still tell the two apart.
+        # 'batch_aware_merging': {
+        #     'batch_obs': 'platform',        # column of adata.obs naming each cell's batch
+        #     'lfc_conservation_th': 0.7,     # fraction of batches that must agree on a gene
+        #     'conservation_lfc_th': 0.6931472,  # optional; the fold change a gene must clear to
+        #                                        # count as agreeing (default: thresholds['lfc_thresh'])
+        #     'thresholds': {                 # optional per-batch overrides; unlisted batches
+        #         '10X_nuclei_v3': {'q1_thresh': 0.3},  # inherit the values above (WMB2 production:
+        #     },                              # nuclei sample less RNA -> lower detection bar)
+        # },
     }
     onestep_kwargs = OnestepKwargs(
         means_vars_kwargs = means_vars_kwargs,
