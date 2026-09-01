@@ -197,7 +197,7 @@ detail does not fit in memory and matches R's profile.
 
 ## The example
 
-`examples/post_clustering_qc_example.py` replicates the workflow block by block, each annotated with the
+`examples/4_post_clustering_qc_example.py` replicates the workflow block by block, each annotated with the
 R lines it mirrors, and writes the same three CSVs (`doubletsClusters`, `doubletsClusters_byMarker`,
 `lowQClusters`).
 

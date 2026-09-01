@@ -845,4 +845,4 @@ The whole-pipeline consequences of the `present` fix are in
 
 `_compare_detail.py` walks one bin-pair at a time and reads only the matching `(i,j)` and `(j,i)`
 partitions from each side, so peak memory stays bounded despite the ~28 M rows/side.
-Usage example: `transcriptomic_clustering/examples/de_all_pairs_example.py`.
+Usage example: `transcriptomic_clustering/examples/3_de_all_pairs_example.py`.

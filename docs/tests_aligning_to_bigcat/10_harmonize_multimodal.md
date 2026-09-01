@@ -169,7 +169,16 @@ disagreements.
 
 ### tests
 
-`tests/test_merging_batch_aware.py`, 19 tests, all passing (run inline; the `tc` env has no pytest).
+**The headline result, stated precisely.** Given the same input, the batch-aware merge reproduces
+deterministic R's decisions exactly — ARI 1.000000 on the first-step clusters (test 3) and on the
+326-cluster recursion in both evaluation modes (test 4). But that is a **measured** outcome, not a
+mathematical guarantee: test 4-2 runs the same comparison on a different input and finds two
+disagreements (ARI 0.999599), both pairs whose scores sit within ~1% of the `de.score.th=100` cutoff,
+where the `ebayes`-vs-`fast_limma` offset decides the call. The accurate claim is therefore: **the
+rule is identical, and decisions match unless a score falls inside that sliver — in which case Python
+merges and R does not.** See the boxed note in test 4 for why, and test 4-2 for the instance.
+
+`tests/test_merging_batch_aware.py`, 24 tests, all passing (run inline; the `tc` env has no pytest).
 The two that carry the argument: `test_contradictory_difference_merges` (genes flipping direction
 between batches are filtered and the pair merges — **while the pooled merge on the same data keeps it
 split**, so the test proves the batch logic did the work) and `test_one_objecting_batch_vetoes`.
@@ -185,6 +194,10 @@ and becomes byte-reproducible once that is removed.** (See the `max.cl.size`-is-
 bullet under implementation details: without an explicit `cl.stats.list`, `merge_cl_multiple`
 computes its statistics on a fresh random ≤300-cell sample per cluster per platform, reseeded from
 the clock every run — regardless of the `max.cl.size` argument.)
+
+(These runs use R on its **native** per-platform gene spaces, not the shared intersection matrix of
+tests 3-4, so their cluster counts are not directly comparable with those tests. Nothing here depends
+on the gene space: the finding is about R's internal sampling.)
 
 **Before the fix** — six runs of the identical script on byte-identical inputs (same post-dissolve
 clustering, md5-checked), **all at R's production `pairBatch=100`** and with `max.cl.size=1e9`
@@ -250,6 +263,40 @@ fixed order, and sums statistics deterministically. Python needs no equivalent o
 `cl.stats.list` workaround: it computes per-batch statistics on all cells unless `max_cl_size` is
 explicitly set.
 
+## The gene space used for all comparisons — and how it differs from R's native setup
+
+**This applies to tests 3, 4 and 4-2 alike.** Both implementations receive **one h5ad on the
+intersection gene space** — the 21,205 genes present in all three platforms' references — and no
+`genes_by_batch`. That is what a combined h5ad normally is, and it is the fair way to compare two
+implementations: identical evidence on both sides, so any difference is the merge rule.
+
+R natively works from three *separate* matrices with different gene lists (32,285 / 32,285 / 21,899).
+So this configuration is deliberately **not** R's native one, and the consequence must be stated
+plainly:
+
+**On the intersection axis the merge is more permissive — it merges more — because modality-specific
+DE genes are not there to prevent merging.** A gene present in only one platform's reference is
+judged by that platform alone (1 of 1 measurers agree = 100%), survives the conservation filter, and
+adds to that platform's separation score, where it can veto a merge single-handedly. Intersection
+deletes those ~11,800 genes before the merge runs, so that veto evidence never exists.
+
+The effect is measurable **within R itself**, which removes any implementation question — the same
+303-cluster input, the same code, only the gene space changing:
+
+| R's gene space | result |
+|---|---|
+| native, three references (32,285 / 32,285 / 21,899) | 303 -> **280** |
+| restricted to the 21,205-gene intersection | 303 -> **278** (ARI 0.9976 vs the above) |
+
+Two extra merges on that input; on the 326-cluster input of test 4 the two gene spaces happened to
+give the identical partition, so the size of the effect is input-dependent, not fixed.
+
+**When it matters, the remedy is upstream, not in the merge**: build the combined matrix on the
+*union* of the references and pass each platform's gene list as
+`batch_aware_merging['genes_by_batch']`, which restores R's native accounting exactly (a platform
+votes on a gene only if its reference contains it). No merge-side setting can recover evidence that
+an inner join already discarded.
+
 ## Test 3 — R vs Python, on first-step clusters -> test the batch-aware merging
 
 ### the test data
@@ -268,13 +315,22 @@ the same side of R's 50,000-cell `present` branch. Production call site:
 | input clustering | **Python** `cluster_louvain` on the latent — k=15, leiden, euclidean, `jaccard_prune = 1/(k-1)` -> **39 clusters** (420-17,842 cells each) |
 | thresholds | the relaxed per-platform `de.param` from `run_iter_cluster.R:54-70`; listed per arm in the result table |
 
-**The design.** That one Python clustering is handed unchanged to *both* merge implementations, so the
-comparison isolates the merge rule — no clustering-algorithm difference enters. Each side computes its
-own per-batch statistics from the normalized matrix on **all cells**. R runs with `joint.rd.dat`
-supplied (so its shortlist uses the same embedding) and with those all-cells statistics passed via
-`cl.stats.list` — which, per test 1, is what actually makes R deterministic (`max.cl.size=1e9` alone
-does not; the original runs of this test predated that discovery, and the deterministic reruns
-produced the **identical partition** in both threshold configurations, so the table stands).
+**The design.** One Python clustering and **one expression matrix** are handed to *both* merge
+implementations, so the comparison isolates the merge rule — no clustering-algorithm difference and no
+evidence difference enters.
+
+The matrix is the **intersection gene space**: `expr.h5ad`, the 21,205 genes present in all three
+platforms' references. This is what a combined h5ad normally is, and it is given to both sides — R's
+statistics are restricted to the same 21,205 genes (`_merge_R.R`'s `isect` mode), so every platform
+sees exactly the same genes. **No `genes_by_batch` is set**, and none is needed: on an intersection
+axis every gene is in every platform's reference, so "every platform votes on every gene" is the
+correct accounting for both implementations. (What this configuration costs relative to R's native
+three-matrix layout is measured in *The gene space used for all comparisons*, above.)
+
+Each side computes its own per-batch statistics from that matrix on **all cells**. R runs with
+`joint.rd.dat` supplied (so its shortlist uses the same embedding) and with those all-cells statistics
+passed via `cl.stats.list` — which, per test 1, is what actually makes R deterministic
+(`max.cl.size=1e9` alone does not).
 
 **Inputs verified before any merge** (else a merge disagreement would be uninterpretable): Python's
 per-batch statistics vs R's, on all 39 clusters x 3 platforms — `present` **bit-exact**, `means` and
@@ -291,13 +347,14 @@ Same 39-cluster input handed to every arm. Two experiments: **production thresho
 0.4), which removes the threshold difference so a pooled-vs-batch-aware disagreement is attributable
 to the method alone.
 
-| experiment | arm | q1.th (v3 / v2 / nuclei) | pair_batch | clusters | merge group | ARI vs R | runtime* |
-|---|---|---|---|---|---|---|---|
-| production thresholds | R batch-aware `merge_cl_multiple` | 0.4 / 0.4 / **0.3** | 100 | 39 -> **37** | `{6, 7, 22}` | — | 240.7 s |
-| production thresholds | **Python batch-aware** (this port) | 0.4 / 0.4 / **0.3** | 100 | 39 -> **37** | **`{6, 7, 22}`** | **1.000000** | 185.8 s |
-| uniform q1 | R batch-aware | 0.4 / 0.4 / 0.4 | 100 | 39 -> 37 | `{6, 7, 22}` | — | — |
-| uniform q1 | **Python batch-aware** | 0.4 / 0.4 / 0.4 | 100 | 39 -> 37 | **`{6, 7, 22}`** | **1.000000** | — |
-| **both** | Python pooled (original), control | 0.4 (single pooled test) | n/a | 39 -> 37 | `{6, 7, 18}` | 0.913228 | 91.9 s |
+| arm | q1.th (v3 / v2 / nuclei) | clusters | merge group | ARI vs R | runtime* |
+|---|---|---|---|---|---|
+| R batch-aware `merge_cl_multiple` | 0.4 / 0.4 / **0.3** | 39 -> **37** | `{6, 7, 22}` | — | 31.5 s |
+| **Python batch-aware** (this port) | 0.4 / 0.4 / **0.3** | 39 -> **37** | **`{6, 7, 22}`** | **1.000000** | 276.8 s |
+| Python pooled (original), control | 0.4 (single pooled test) | 39 -> 37 | `{6, 7, 18}` | 0.913228 | 219.7 s |
+
+Both merge arms run **exhaustively** (every shortlisted pair scored each round — Python's default and
+R `pairBatch=1e9`).
 
 Shared parameters, all arms: `de.score.th=100`, `min.cells=10`, `min.genes=5`, `padj.th=0.01`,
 `q.diff.th=0.7`, `lfc.th`/`low.th` = 1 (log2) = `ln 2` (Python), `lfc_conservation_th=0.7`,
@@ -316,10 +373,11 @@ timings are omitted.
 
 **Final-configuration confirmation.** After every later fix (correlation shortlist with
 self-in-top-k, exact post-merge variance, destination = larger cluster, R-style tie order,
-`cl.small` dissolve, union gene axis with per-platform `genes_by_batch` masks), both experiments
-were rerun end to end: **ARI 1.000000 in both**, identical merge groups, pooled control unchanged
-(0.913228). The table above therefore stands under the final code, not just the version that first
-produced it.
+`cl.small` dissolve), the experiment was rerun end to end in the configuration above: **ARI
+1.000000**, identical merge groups, pooled control unchanged (0.913228). A uniform-q1 variant (all
+platforms at 0.4, removing the per-platform threshold difference) was run earlier and gave the same
+answer — `{6,7,22}` batch-aware, `{6,7,18}` pooled — so the pooled/batch-aware flip below is
+attributable to the method, not to nuclei's relaxed `q1.th`.
 
 Two conclusions, one per experiment:
 
@@ -355,11 +413,11 @@ Input: the Python pipeline's full recursive clustering of `TH-EPI-Glut` (hicatMP
 merging at every level, `split_size=100` = R `i_harmonize`'s default) — **348 clusters**, reduced to
 **326** after dissolving `cl.small` (22 clusters below `min.cells` in every platform; done once in
 the harness so both sides provably start identical, and since ported into `merge_clusters`'
-batch-aware branch). Both sides use their platform's own full gene axis: R natively from `comb.dat`
-(32,285 / 32,285 / 21,899 genes per platform), Python via the union-axis export (32,979 genes) with
-`genes_by_batch` masks. Thresholds as in test 3 (production). Inputs verified per platform over its
-**full own gene list** before any merge: `present` bit-exact, means/sqr_means at float32 transport
-noise (worst 2.4e-6).
+batch-aware branch).
+
+Gene space and thresholds exactly as in test 3: **one h5ad on the 21,205-gene intersection, given to
+both sides** (R's statistics restricted to the same genes), **no `genes_by_batch`**. Inputs verified
+per platform before any merge: `present` bit-exact, means/sqr_means at float32 transport noise.
 
 ### the result
 
@@ -369,40 +427,56 @@ final code, verified cell-for-cell identical across nodes (test 2).
 | config | R (deterministic) | Python | ARI | merge groups identical |
 |---|---|---|---|---|
 | exhaustive (`pair_batch` off) | 326 -> **285** (41 merges) | 326 -> **285** | **1.0000000** | **30 of 30 — identical partitions** |
-| production (`pair_batch=100`) | 326 -> 287 (39 merges) | 326 -> 286 | 0.9999981 | 28 of 28 (R) / 29 (Py) |
-| pooled control | — | 326 -> 256 (70 merges) | ~0.79 vs R batch-aware | 12 |
+| production (`pair_batch=100`) | 326 -> **285** | 326 -> **285** | **1.0000000** | **30 of 30 — identical partitions** |
+| pooled control | — | 326 -> 256 (70 merges) | 0.7776 vs R batch-aware | 12 of 30 / 40 |
 
-**In exhaustive mode the port and deterministic R produce the identical partition** — every one of
-41 merge decisions, all 30 merge groups, ARI exactly 1.0.
+**The port and deterministic R produce the identical partition, in BOTH evaluation modes** — every
+one of 41 merge decisions, all 30 merge groups, ARI exactly 1.0, exhaustively and at R's production
+`pairBatch=100`.
 
-**To be precise about what this does and does not claim: exact agreement is a measured outcome on
-this dataset, not a mathematical guarantee.** The two sides never compute identical scores: the DE
-engines differ (Python `ebayes` vs R `fast_limma`, ~0.2-1% in the t-statistic on the same fit), and
-Python reads a float32 export while R reads its float64 store (statistics differing from the 7th
-significant digit). Every pair's score therefore carries a small direct difference, and the merge
-rule is a hard threshold — so a pair whose score happened to fall inside that sliver around
-`de.score.th=100` (say 99.95 on one side, 100.05 on the other) would merge on one side only, on any
-dataset where that occurs. What exhaustive evaluation *does* guarantee is that this direct sliver is
-the **only** possible source of disagreement: both sides score every shortlisted pair every round,
-so their evaluation contexts stay locked together and a small difference can never fork the merge
-history and cascade (the `pairBatch` mechanism of test 1). On this dataset, none of the 41
-decisions' scores fell inside the sliver under matched contexts, so the agreement came out exact —
-and if a future dataset does produce a disagreement in exhaustive mode, it will be a single
-borderline pair with a near-threshold score, immediately diagnosable, not a chain of divergence.
+> ### ARI 1.0 is a MEASURED result, not a mathematical guarantee
+>
+> **Test 4-2 proves this, and is not a hypothetical**: same code, same gene space, same thresholds,
+> same exhaustive mode — **only the input clustering differs** — and agreement drops from 1.0 here to
+> 0.999599 there, on two pairs. Read the two tests together, never test 4 alone.
+>
+> **Why exact agreement cannot be guaranteed.** The two sides never compute identical scores: the DE
+> engines differ (Python `ebayes` vs R `fast_limma`, ~0.2-1% in the t-statistic on the same fit), and
+> Python reads a float32 export while R reads its float64 store (statistics differing from the 7th
+> significant digit). Every score therefore carries a small offset, and the merge rule is a hard
+> threshold — so a pair landing inside that sliver around `de.score.th=100` merges on one side only.
+> Whether any pair lands there depends on the data.
+>
+> **What IS guaranteed by construction, in exhaustive mode**: such a disagreement can only ever be a
+> *direct offset on a single pair*, never a cascade. Both sides score every shortlisted pair every
+> round, so their evaluation contexts stay locked together and one differing decision cannot fork the
+> merge history (the `pairBatch` mechanism of test 1). Test 4-2 bears this out — its two disagreeing
+> pairs are isolated, every other decision matched.
+>
+> **The offset has a consistent sign, so the failure mode is directional.** On all five near-threshold
+> merges both sides made in test 4-2, Python scored *lower* than R (50.69/61.64/63.54/81.55/93.46 vs
+> R's 50.88/61.84/63.66/82.62/93.56). A pair scoring just *above* 100 in R is therefore at risk of
+> falling *below* it in Python — which is exactly what happened (Python's extra merge at 98.96) —
+> while the reverse is unlikely. Expect any future disagreement to be **Python merging slightly more
+> at the margin, not less**. (Five observations plus a mechanism: a consistent tendency on this data,
+> not a proven law.)
+>
+> **So the accurate claim for the port is not "identical" but:** the merge rule is identical, and
+> decisions match exactly unless a pair's score sits within ~1% of the cutoff — in which case Python
+> merges and R does not. That is a stronger statement than an ARI, because it comes with a stated
+> failure mode, a direction, and a bound.
 
-**At production configuration** (`pair_batch=100`, R's lazy evaluation) the two sides differ by
-exactly **one merge**: `{148,296}` (139 of 285,230 cells), which Python makes and production-R
-declines. The exhaustive run shows this is not a disagreement about the pair — **exhaustive R merges
-`{148,296}` too**. It is an evaluation-history effect of R's own design, faithfully ported: with
-lazy batching, a pair's score depends on which pairs share its evaluation batch (mechanism 3 below),
-and on the two sides' slightly different batch histories this borderline pair lands on opposite
-sides of `de.score.th=100`. The previous residual reported here (ARI 0.9917, flip-flopping groups
-`{104,333}`, `{326,330}`, `{203,343}`) was **entirely R's hidden statistics sampling** (test 1):
-those groups stopped flipping the moment R ran on full-population statistics.
+**Production `pairBatch=100` agrees too, on this input.** Lazy evaluation makes a pair's score depend
+on which pairs share its evaluation batch (mechanism 3 below), so the two sides' batch histories can
+in principle diverge — on an earlier union-gene-space run of this same input it did, by exactly one
+borderline merge (`{148,296}`, 139 cells, which exhaustive R also merges). Here both modes land on
+the same 285 clusters. Earlier residuals reported in this section (ARI 0.9917, flip-flopping groups
+`{104,333}`, `{326,330}`, `{203,343}`) were **entirely R's hidden statistics sampling** (test 1):
+they stopped flipping the moment R ran on full-population statistics.
 
 ("merge groups identical": a merge group is a set of starting clusters fused into one final cluster;
 the column counts groups whose membership matches exactly between R and Python. Unique groups:
-production — Python-only `{148,296}`; exhaustive — none.)
+none, in either mode.)
 
 **What `pair_batch=100` buys in runtime: ~1%.** Measured properly — one allocation on one node
 (n94), inputs loaded once, two interleaved repetitions of each mode — the Python merge takes
@@ -438,7 +512,12 @@ Every step below is the same input and exhaustive evaluation; only the named def
 | + gene axes matched (control: BOTH sides restricted to the 21,205-gene intersection) | 0.9978 | 3 |
 | + full per-platform axes (Python via `genes_by_batch`) | 0.974 exhaustive / 0.990 production | 5 + 5 |
 | + variance fit per evaluation chunk (audit 4, below) | 0.974 exhaustive / 0.9947 production | 1 + 3 (production) |
-| + deterministic R reference (test 1: `cl.stats.list` supplied — the rows above compared against sampled R) | **1.0000000 exhaustive** / 0.9999981 production | 0 (exhaustive) / 1 (production) |
+| + deterministic R reference (test 1: `cl.stats.list` supplied — the rows above compared against sampled R) | 1.0000000 exhaustive / 0.9999981 production | 0 (exhaustive) / 1 (production) |
+| + one intersection-axis matrix for BOTH sides (the configuration of tests 3-4 above) | **1.0000000 in both modes** | 0 |
+
+Rows 3-6 were measured on the union gene axis, because closing the gene-axis defect (mechanism 2)
+required giving Python the genes R could see. The final row is the configuration the tests now
+report: a single intersection matrix shared by both sides, where the axis question does not arise.
 
 Four mechanisms accounted for everything traceable:
 
@@ -453,7 +532,9 @@ Four mechanisms accounted for everything traceable:
    Python 0): the entire gap was one nuclei-only gene, `Gm26992`, at `-log10(padj)=50` in R and
    invisible to Python. The pre-flight had not caught it because it, too, compared statistics only
    on the intersection — a verification blind spot, since closed (each platform now checked over its
-   full own axis).
+   full own axis). Note this defect was an *asymmetry*: R saw genes Python did not. Tests 3-4 remove
+   it by construction — one matrix, one axis, both sides — and the cost of that axis relative to R's
+   native three references is measured separately above.
 3. **The variance-fit population** (audit 4). An engine-internals probe first DISPROVED the obvious
    suspect: given the same fit design, `fast_limma` and `ebayes` agree to ~1% in t (Syt6 t = -13.850
    vs -13.761; identical df, stdev.unscaled, near-identical prior) — the engines were never the
@@ -479,30 +560,29 @@ stage — statistics bit-exact, same DE genes, engines within 0.2% (pair `306_50
 
 ### the residual, bounded and explained
 
-Against deterministic R the residual is: **exhaustive mode — zero** (identical partitions, ARI 1.0);
-**production mode — one single-pair merge**, `{148,296}` (Python-only, 139 cells). Everything
-reported as residual in earlier drafts (`{104,333}`, `{326,330}`, `{203,343}`, the 277/153/202
-regroupings) was R's sampling noise and vanished with it (test 1).
+Against deterministic R on this input the residual is **zero in both evaluation modes** — identical
+partitions, ARI 1.0. Everything reported as residual in earlier drafts (`{104,333}`, `{326,330}`,
+`{203,343}`, `{148,296}`, the 277/153/202 regroupings) is gone: those were R's hidden statistics
+sampling (test 1) and, for `{148,296}`, a `pairBatch` evaluation-history effect on a union-gene-space
+run of the same input.
 
-The one production difference is bounded by the exhaustive result: exhaustive R **also merges**
-`{148,296}`, so both implementations agree the pair belongs together — production-R declines it only
-because of `pair_batch` evaluation history. Under lazy batching a pair's score depends on **when it
-was first evaluated and which pairs shared that evaluation batch** (the fit population, mechanism 3
-above) — R's own design, faithfully ported. The two sides' batch histories differ slightly (each
-round stops testing at its own first mergeable pair), and this borderline pair's score lands on
-opposite sides of `de.score.th=100` in the two histories. Exact production convergence would mean
-reproducing R's incidental evaluation history, not its rules — and the exhaustive run demonstrates
-that when the histories are forced to coincide, the agreement is exact.
+**That is a measured outcome, not a mathematical guarantee** — and test 4-2 below shows the exception
+occurring on a different input, which is worth reading as the honest bound on this result. The two
+sides never compute identical scores: the DE engines differ (Python `ebayes` vs R `fast_limma`,
+~0.2-1% in the t-statistic on the same fit) and Python reads a float32 export while R reads its
+float64 store. Every score therefore carries a small direct offset, and the merge rule is a hard
+threshold, so a pair whose score lands inside that sliver around `de.score.th=100` merges on one side
+only. What exhaustive evaluation guarantees is that this sliver is the **only** possible source of
+disagreement — both sides score every shortlisted pair every round, so evaluation contexts stay
+locked and a small difference cannot fork the merge history and cascade.
 
-The pair's measured scores make both points — borderline *and* context-dependent — with R's own
-numbers. `148_296` is judgeable only by `10X_cells_v3` (the clusters have just 13 and 10 cells
-there; the other platforms hold too few and vote merge), and both sides conserve the **identical 9
-genes** (Kcnh1, E130114P18Rik, Angpt1, Sorcs1, Arhgef26, Nfia, Nell1 up; Cdh20, St6galnac5 down).
-On identical full-population statistics, **R itself scores the pair 100.92 in the production run's
-evaluation context** (first batch of 100 pairs — 0.92 over the threshold, declined) **but 85.25 in
-the exhaustive run's context** (merged): a 15.7-point swing from fit population alone, straddling
-the cliff. Python's production context lands it below 100 (a probe with an all-cluster fit gives
-84.6), i.e. inside R's own context-to-context range.
+The `{148,296}` history from the union-axis run is still the clearest illustration of the
+context-dependence, using R's own numbers. That pair is judgeable only by `10X_cells_v3` (the
+clusters have 13 and 10 cells there; the other platforms hold too few and vote merge), and both sides
+conserve the **identical 9 genes** (Kcnh1, E130114P18Rik, Angpt1, Sorcs1, Arhgef26, Nfia, Nell1 up;
+Cdh20, St6galnac5 down). On identical full-population statistics **R itself scores the pair 100.92 in
+one evaluation context and 85.25 in another** — a 15.7-point swing from fit population alone,
+straddling the cliff.
 
 The per-pair probe also showed the conservation filter agreeing exactly where it can: four
 Y-chromosome genes (a sex-composition batch artefact, nuclei-only signal) dropped identically by
@@ -529,6 +609,60 @@ decisions. Neither compares the clustering, because that comparison does not exi
 clustering step, so R's recursive pipeline is batch-aware at every level; and `flag.merge=FALSE` in
 `run_iter_cluster.R:89` is a no-op — the parameter does not exist in `harmonize.R`.)
 
+## Test 4-2 — the same comparison on a FINAL-CODE input, as a no-distortion check
+
+Test 4's input (348 clusters) was generated on 2026-08-25, *before* the audit fixes landed — it is a
+pinned artefact of interim code. That is harmless for test 4 (both sides receive it identically), but
+it leaves one question open: **is the merge still exactly R's after everything added since?** Test 4-2
+answers it by repeating the comparison on an input the code has never been tuned against.
+
+**Input:** the final-code recursion — hicatMPI, batch-aware at every level, run end to end
+(`hicatMPI/tests/WMB_TH_285k_batchaware`) — **303 clusters**, 285,230 cells. Same gene space and thresholds as
+tests 3 and 4: one intersection-axis h5ad for both sides, no `genes_by_batch`. Two facts worth
+recording about the input:
+
+- R's harness reports **`cl.small: 0 of 303`**: the per-level dissolve now runs automatically inside
+  every merge, so nothing unjudgeable survives to the final merge and the harness's pre-dissolve step
+  has no work to do. (Test 4's interim-code input had accumulated **22 of 348** such clusters.)
+- The same partition is reproduced by three independent runs — two config spellings of the hicatMPI
+  example and the original report-10 harness config under final code — all ARI 1.0 against each other.
+
+**Result** (both exhaustive; R deterministic):
+
+| | R (deterministic) | Python (default, final code) |
+|---|---|---|
+| clusters | 303 -> **278** | 303 -> **276** |
+| ARI | **0.999599** | |
+| merge groups identical | **18** of 19 (R) / 20 (Py) | |
+| pooled control, same input | — | 303 -> 248 (ARI 0.8016 vs R, 9 of 19/31 groups) |
+
+**The merge rule is not distorted, and the two disagreements are the documented borderline sliver —
+now observed rather than hypothesised.** This test is the empirical proof of the boxed caveat in
+test 4: ARI 1.0 there is a measured result on that input, not a property of the port. Python makes two merges R declines: it folds `190` into
+`{195, 285, 69}`, and merges `{196, 72}`. Every other decision matches. The scores show exactly what
+test 4 predicted would eventually happen on some input:
+
+| | R | Python |
+|---|---|---|
+| highest score still merged | 93.56 | **98.96** |
+| shared merges, near threshold | 50.88 · 61.84 · 63.66 · 82.62 · 93.56 | 50.69 · 61.64 · 63.54 · 81.55 · 93.46 |
+
+The shared merges agree to 0.1-1.1 points — the `ebayes`-vs-`fast_limma` engine offset of ~0.2-1%,
+exactly as characterised. Python's extra merge sits at **98.96 against a threshold of 100**: about
+1% below the cliff, which is the width of that offset. R scored the same pair just above 100 and kept
+the clusters apart. This is the single-borderline-pair failure mode described in test 4 — one pair,
+near-threshold, immediately diagnosable, with no cascade (every other merge is identical).
+
+Everything added since test 4 — the inert-override leniency, the strict threshold-key validation, the
+FutureWarning axis pin, and all the packaging work — therefore leaves the rule intact; what differs
+is two decisions the engine offset placed on opposite sides of a hard cutoff. The pooled control on
+the same 303 clusters shows the method effect is as wide as ever (31 merge groups vs 19; ARI 0.80),
+so the agreement is discriminating rather than an artefact of little merging.
+
+(The later pooled-path rule alignments of report 5 (§6b) do not touch this result: they live in
+`merge_clusters_by_de` / `get_k_nearest_clusters`, while the batch-aware path uses
+`merge_clusters_by_de_batch_aware` / `_shortlist_pairs_correlation` and `_dissolve_cl_small`.)
+
 ## Test 5 — Python batch-aware pipeline vs CK's production R run, end to end
 
 The four tests above hold the input fixed to isolate one step at a time. This test asks the
@@ -539,16 +673,21 @@ production result on this neighborhood versus the Python batch-aware pipeline?
 `WMB_Integration/WMB2/deNovo_nh9_v7/TH-EPI-Glut/Final_Merge_AM/result.merged.rda`
 (`run_iter_cluster.R:118-121`: harmonizing recursive clustering `knn_joint`/`i_harmonize`, then
 `merge_cl_multiple` at production settings), extracted to `TH-EPI-Glut/merge_cl_R_production.csv`.
-**The Python side:** the batch-aware pipeline at default settings (hicatMPI recursion on the scVI
-latent, exhaustive batch-aware final merge — job 25424388). Both cover the identical 285,230 cells.
+**The Python side:** the batch-aware pipeline at default settings, run end to end with the FINAL
+code (hicatMPI recursion on the scVI latent -> 303 clusters, exhaustive batch-aware final merge ->
+276; `hicatMPI/tests/WMB_TH_285k_batchaware/out/clusters_after_final_merge.csv`). Note this recursion is
+final-code, unlike test 4's pinned input (348, generated by pre-audit interim code; final-code
+reruns of that configuration reproduce 303 exactly, ARI 1.0, twice on different nodes — the
+348-vs-303 difference is purely the audit fixes acting at every recursion level). Both sides cover
+the identical 285,230 cells.
 
-| | production R pipeline | Python batch-aware pipeline |
+| | production R pipeline | Python batch-aware pipeline (final code) |
 |---|---|---|
-| clusters | 278 | 285 |
-| ARI | **0.6407** | |
-| NMI | **0.8152** | |
-| cell-weighted purity (majority cross-label) | 0.735 (R clusters vs Py) | 0.785 (Py clusters vs R) |
-| clusters ≥90% pure | 106 of 278 | 111 of 285 |
+| clusters | 278 | 276 |
+| ARI | **0.6358** | |
+| NMI | **0.8145** | |
+| cell-weighted purity (majority cross-label) | 0.746 (R clusters vs Py) | 0.775 (Py clusters vs R) |
+| clusters ≥90% pure | 115 of 278 | 114 of 276 |
 
 ![production R pipeline vs Python batch-aware pipeline, end to end](images/heatmap_test5_prodR_vs_py.png)
 
@@ -574,12 +713,15 @@ tests 3-4, nothing is held fixed here, and four differences compound:
 4. **Different small-cluster handling along the way** (R dissolves per level inside `knn_joint`'s
    merge; Python per level in its own recursion), which shifts where borderline cells sit before the
    final merge ever runs.
+5. **Different gene spaces.** R works from its three native references; the Python run uses the
+   intersection h5ad, so modality-specific genes cannot veto merges (see *The gene space used for
+   all comparisons*). On a shared input this alone accounts for a few extra Python merges.
 
 Read together with tests 3-4, the division of labor is: **the merge rule is the same** (identical
 partitions when given identical inputs, test 4) — **the ARI 0.64 here is the two pipelines'
-*clustering* strategies plus production R's sampling noise**, not the merge port. The purity
-asymmetry (0.785 vs 0.735) and counts (285 vs 278) say Python's result is slightly finer and maps
-somewhat more cleanly into R's clusters than the reverse.
+*clustering* strategies plus production R's sampling noise**, not the merge port. The two sides
+land at essentially the same granularity (276 vs 278), with Python's clusters mapping slightly more
+cleanly into R's than the reverse (purity 0.775 vs 0.746).
 
 ---
 
@@ -725,6 +867,19 @@ that comes from per-dataset expression.
 
 *harmonize.R is for clustering without an integrated space
 *the ***impute*.R scripts are needed for imputation when there is no integrated embedding
+
+**Runs behind tests 3, 4 and 4-2** (all: one intersection-axis h5ad for both sides, no
+`genes_by_batch`, R deterministic via `cl.stats.list`, `isect` mode):
+
+| test | input | R job -> Python job | result |
+|---|---|---|---|
+| 3 | `cl_firststep.csv` (39) | 25521719 -> 25521723 | 37 = 37, ARI 1.0 |
+| 4 exhaustive | `cl_recursive.csv` (326) | 25521720 -> 25521724 | 285 = 285, ARI 1.0 |
+| 4 `pairBatch=100` | `cl_recursive.csv` (326) | 25521721 -> 25521725 | 285 = 285, ARI 1.0 |
+| 4-2 | `cl_recursive2.csv` (303) | 25521722 -> 25521726 | 278 vs 276, ARI 0.9996 |
+
+Gene-space effect measured within R alone (`merge_cl_R_recursive2.csv` native vs
+`merge_cl_R_recursive2_isect.csv`): 280 vs 278 clusters, ARI 0.9976.
 
 
 ---

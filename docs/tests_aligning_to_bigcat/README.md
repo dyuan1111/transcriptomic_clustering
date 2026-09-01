@@ -1,15 +1,8 @@
 # Clustering comparison reports — Python `transcriptomic_clustering` vs R `scrattch.bigcat`
 
 Findings from aligning the Python single-cell clustering pipeline with the R reference, on the same
-194,221 spinal-cord neurons (17,277 genes, 32-d scVI latent) — and, in report 10, on the 285,230-cell
-multi-platform WMB2 `TH-EPI-Glut` neighborhood. Numbered files follow the order the work was done;
-images live in `images/`.
-
-> **Published copy.** These reports are working documents copied from the Allen cluster
-> (`test_clustering/reports/`); they are the validation evidence for the `bigcat-alignment` branch.
-> Two things to know when reading off-site: absolute paths (`/allen/...`, `/home/...`) refer to the
-> Allen filesystem and are kept as provenance, and the harness/probe scripts the reports cite
-> (`_merge_R.R`, `_compare_py.py`, ...) live in that working area, not in this repo.
+194,221 spinal-cord neurons (17,277 genes, 32-d scVI latent). Numbered files follow the order the work
+was done; images live in `images/`.
 
 ## What we changed
 - **[changes.md](changes.md)** — Every source-code and parameter change, **with the measured effect of
@@ -33,8 +26,10 @@ images live in `images/`.
    R vs Python `aligned`/`fast` (ARI/NMI, confusion heatmaps), plus the **runtime analysis** and the merge
    bottleneck fix (74 % pandas `.loc` overhead → numpy, ~8× faster end-to-end).
 5. **[5_final_merging.md](5_final_merging.md)** — The **final merge** (R `merge_cl_big` vs tc
-   `final_merge`): the reduced-space difference (marker genes vs latent), and the isolation test showing
-   the two implementations agree at **ARI 0.997** — so the final merge contributes ~nothing to the gap.
+   `final_merge`): the reduced-space difference (marker genes vs latent), and the isolation test — first
+   **ARI 0.997**, then traced to two correctable rule differences (variance-fit population, shortlist
+   width), both since fixed, giving **ARI 1.0** on the same input. Also carries the end-to-end pooled
+   comparison before and after the final merge.
 
 6. **[6_de_all_pairs_R_vs_python.md](6_de_all_pairs_R_vs_python.md)** — The **all-pairs DE** step head to
    head on the same clustering. Found **two defects, one per pipeline**: R subsamples 200 cells per
@@ -66,14 +61,11 @@ images live in `images/`.
    **0.912**, annoy **0.875**, **R 0.814** — so **both Python backends agree with R more closely than R
    agrees with itself**, and pynndescent is exactly deterministic at a fixed seed.
 
-10. **[10_harmonize_multimodal.md](10_harmonize_multimodal.md)** — The **batch-aware merging port**
-    (`merge_cl_multiple` -> `merge_clusters(..., batch_aware_merging=...)`) and its validation on the
-    285,230-cell multi-platform WMB2 `TH-EPI-Glut` neighborhood. Five tests: R's own reproducibility
-    (nondeterministic solely from a hidden 300-cell statistics subsample; byte-reproducible once
-    statistics are supplied), Python's reproducibility (cell-identical across nodes), the isolated
-    merge-rule comparisons (**ARI 1.000000** first-step; **identical partitions** in exhaustive mode,
-    0.9999981 at R's production `pairBatch=100`), and the end-to-end pipeline comparison against CK's
-    production run (ARI 0.64 -- dominated by the different recursive clusterings, not the merge).
+10. **[10_harmonize_multimodal.md](10_harmonize_multimodal.md)** — How scrattch.bigcat's **`harmonize`**
+    family clusters several datasets/modalities jointly, and what a Python port would need.
+    Harmonization there is **graph-level, not expression-level**: cross-dataset KNN edges pull matching
+    types together and a conserved-fold-change rule keeps batch effects from becoming cell types. Read
+    from source plus one production script; `transcriptomic_clustering` has no equivalent.
 
 ## Supporting
 - **[three_way_comparison.md](three_way_comparison.md)** — R vs **stock** `transcriptomic_clustering` vs
