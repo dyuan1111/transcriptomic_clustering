@@ -4,6 +4,7 @@ import anndata as ad
 import pandas as pd
 import numpy as np
 from scipy.spatial.distance import cdist
+from scipy.sparse import issparse
 import logging
 from collections import defaultdict
 import warnings
@@ -96,7 +97,10 @@ def merge_clusters(
         - ``genes_by_batch`` (optional): ``{batch: genes that batch's reference measures}``, for
           multi-platform data whose references carry different gene lists. Each batch's DE runs on
           its own genes, and a gene measured by only ONE platform still counts as evidence (it is
-          trivially conserved), as in R. Omit when every batch measures every gene.
+          trivially conserved), as in R. Omit when every batch measures every gene of the data's
+          axis (an intersection axis, or single-platform data) -- that is already exactly R. For a
+          UNION axis, supply the platforms' library lists (whoever built the union h5ad has them):
+          the matrix itself cannot distinguish "never measured" from "measured, zero counts".
         - ``pair_batch`` (optional, default None): None tests every shortlisted pair each round (the
           deterministic reference). An integer N mirrors R's ``pairBatch`` (100 in production): test
           N pairs at a time by decreasing centroid similarity and stop the round's testing as soon
@@ -238,6 +242,7 @@ def merge_clusters(
             low_th=thresholds['low_thresh'],
         )
         logger.info(f'Per-batch Cluster Means Elapsed Time: {time.perf_counter() - tic_b}')
+
         # batch_thresholds was resolved before the cl.small dissolve; batches with no cells in any
         # cluster cannot occur here (every batch has cells, every cell has a cluster)
         cl_means, cl_vars, present_cl_means = merge_clusters_by_de_batch_aware(
@@ -641,14 +646,20 @@ def merge_clusters_by_de(
             # per-cluster cell counts for the DE test; if max_cl_size is None the cap is DISABLED
             # (use all cells), else cap at max_cl_size (recomputed each round so merged clusters re-cap)
             cl_size_de = cl_size if max_cl_size is None else {c: min(n, max_cl_size) for c, n in cl_size.items()}
-            # rebuild small DataFrames of the LIVE clusters from the numpy state (single-block wrap, cheap;
-            # matches the old path which passed the full live-cluster means/vars/present each round)
-            live_labels = [lab for lab in labels if lab in live]
-            live_rows = [row_of[lab] for lab in live_labels]
-            means_df = pd.DataFrame(means_np[live_rows], index=live_labels, columns=genes, copy=False)
-            present_df = pd.DataFrame(present_np[live_rows], index=live_labels, columns=genes, copy=False)
+            # Fit population = THE CALL'S OWN CLUSTERS, matching R's de_selected_pairs
+            # (select.cl <- unique(c(pairs$P1, pairs$P2)), de.genes.R:1152-1154): the eBayes
+            # variance model is fit over only the clusters of the pairs being scored, so a pair's
+            # score depends on which pairs share its call -- R's context-dependent scoring, the same
+            # rule the batch-aware path adopted in audit 4. (Before this change Python fit over ALL
+            # live clusters; the difference flipped two borderline merges on the report-5 data --
+            # see reports 5/11 and the equalization experiments.)
+            call_cls = {c for pr in to_compute for c in pr}
+            fit_labels = [lab for lab in labels if lab in live and lab in call_cls]
+            fit_rows = [row_of[lab] for lab in fit_labels]
+            means_df = pd.DataFrame(means_np[fit_rows], index=fit_labels, columns=genes, copy=False)
+            present_df = pd.DataFrame(present_np[fit_rows], index=fit_labels, columns=genes, copy=False)
             if de_method == 'ebayes':
-                vars_df = pd.DataFrame(vars_np[live_rows], index=live_labels, columns=genes, copy=False)
+                vars_df = pd.DataFrame(vars_np[fit_rows], index=fit_labels, columns=genes, copy=False)
                 new_scores = tc.de_pairs_ebayes(
                     to_compute, means_df, vars_df,
                     present_df, cl_size_de, thresholds,
@@ -746,11 +757,30 @@ def _resolve_batch_thresholds(
     de.param.list is the same idea.
     """
     overrides = overrides or {}
+    # Strictly validate the INNER keys of every override: a misspelled threshold name (e.g.
+    # 'q1_tresh') would otherwise be carried into the merged dict and silently never read --
+    # the batch would quietly run on the shared value. Unlike batch names (which legitimately
+    # vary with the data subset, below), the set of valid threshold keys never does, so this
+    # is a hard error everywhere. 'max_cl_size'/'merge_mode' are accepted because callers pass
+    # them inside the shared thresholds dict.
+    _valid_keys = set(DEFAULT_THRESHOLDS) | set(base_thresholds) | {'max_cl_size', 'merge_mode'}
+    for _b, _ov in overrides.items():
+        _bad = set(_ov) - _valid_keys
+        if _bad:
+            raise ValueError(
+                f"batch_aware_merging['thresholds'][{_b!r}] has unknown threshold keys: "
+                f"{sorted(_bad)}. Valid keys: {sorted(_valid_keys)}"
+            )
     unknown = set(overrides) - set(batches)
     if unknown:
-        raise ValueError(
-            f"batch_aware_merging['thresholds'] has entries for batches not present in the data: "
-            f"{sorted(map(str, unknown))}. Present batches: {sorted(map(str, batches))}"
+        # Not an error: in recursive clustering a branch legitimately holds cells from only some
+        # batches, and an override for a batch with no cells here is simply inert -- exactly as R's
+        # de.param.list entries for sets absent from a subset never get consulted. (The cost of the
+        # leniency is that a misspelled batch name is only detectable at the top level, where all
+        # batches are present -- check the log line below on the first/full-data call.)
+        logger.info(
+            f"batch_aware_merging['thresholds'] overrides for batches with no cells here are "
+            f"ignored: {sorted(map(str, unknown))}. Present batches: {sorted(map(str, batches))}"
         )
     resolved = {}
     for batch in batches:
@@ -1451,10 +1481,12 @@ def get_k_nearest_clusters(
     else:
         cluster_labels = list(cluster_labels)
 
-    if k >= len(all_cluster_labels):
-        logger.debug("k cannot be greater than or the same as the number of clusters. "
-                          "Defaulting to number of clusters - 1.")
-        k = len(all_cluster_labels) - 1
+    # R width semantics (get_knn_pairs / sim_knn): the k-nearest window INCLUDES the cluster
+    # itself (annoy always returns self at distance 0), which R then filters out -- so k proposes
+    # k-1 REAL neighbors per cluster. Python excludes self up front (the diagonal is NaN), so take
+    # k-1 here to propose the same number of pairs R does. (Before this change Python proposed k
+    # real neighbors -- one more than R -- part of the pooled shortlist gap; see reports 5/11.)
+    k = min(k, len(all_cluster_labels)) - 1
 
     similarity = calculate_similarity(
             cluster_means,

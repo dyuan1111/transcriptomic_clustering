@@ -328,15 +328,20 @@ def test_chisq_with_batch_aware_raises():
         raise AssertionError('expected ValueError for de_method=chisq')
 
 
-def test_unknown_batch_in_threshold_overrides_raises():
+def test_absent_batch_in_threshold_overrides_is_inert():
+    """
+    An override for a batch with no cells in the current data must be IGNORED, not fatal: in
+    recursive clustering a branch legitimately holds cells from only some batches (a real WMB
+    thalamus run crashed on the first cells_v2-free branch when this raised), and R's
+    de.param.list entries for absent sets are simply never consulted. The result must equal the
+    run without the inert override.
+    """
     adata, red, assign, cbo = _build({'A': 1.5, 'B': 1.5})
-    try:
-        _merge(adata, red, assign, cbo,
-               {'batch_obs': 'platform', 'thresholds': {'C': {'score_thresh': 10}}})
-    except ValueError as e:
-        assert 'not present in the data' in str(e)
-    else:
-        raise AssertionError('expected ValueError for an unknown batch')
+    with_inert = _merge(adata, red, assign, cbo,
+                        {'batch_obs': 'platform', 'thresholds': {'C': {'score_thresh': 10}}})
+    adata2, red2, assign2, cbo2 = _build({'A': 1.5, 'B': 1.5})
+    without = _merge(adata2, red2, assign2, cbo2, {'batch_obs': 'platform'})
+    assert sorted(map(sorted, with_inert.values())) == sorted(map(sorted, without.values()))
 
 
 # --- constants pinned against the R source -------------------------------------------------------
@@ -452,6 +457,48 @@ def test_per_batch_means_match_manual():
             np.testing.assert_allclose(
                 present.loc[cl].values, (adata.X[idx] > 1).sum(axis=0) / len(idx)
             )
+
+
+def test_misspelled_threshold_key_in_override_raises():
+    """
+    A typo'd threshold key inside a per-batch override (e.g. 'q1_tresh') must be a hard error
+    everywhere: unlike batch names, the valid threshold-key set never varies with the data, and
+    a silently ignored override means the batch quietly runs on the shared value.
+    """
+    adata, red, assign, cbo = _build({'A': 1.5, 'B': 1.5})
+    try:
+        _merge(adata, red, assign, cbo,
+               {'batch_obs': 'platform', 'thresholds': {'B': {'q1_tresh': 0.3}}})
+    except ValueError as e:
+        assert 'unknown threshold keys' in str(e) and 'q1_tresh' in str(e)
+    else:
+        raise AssertionError('expected ValueError for a misspelled threshold key')
+
+
+def test_pooled_shortlist_width_matches_r():
+    """
+    Pooled candidate shortlist proposes k-1 REAL neighbors per cluster, mirroring R's
+    get_knn_pairs/sim_knn where the k window includes self (reports 5/11). With 6 clusters and
+    k=4, each cluster proposes 3 neighbors.
+    """
+    means = pd.DataFrame(np.random.default_rng(0).normal(size=(6, 8)),
+                         index=[str(i) for i in range(6)])
+    pairs = merging.get_k_nearest_clusters(means, k=4)
+    per_cluster = {}
+    for a, b in pairs:
+        per_cluster.setdefault(a, set()).add(b)
+    # every cluster proposed exactly 3 neighbors (some pairs dedupe across clusters, so count
+    # proposals per SOURCE cluster before dedup is not recoverable; instead check the total pair
+    # set equals the union of each cluster's 3 nearest others, computed independently)
+    from scipy.spatial.distance import cdist
+    D = cdist(means.values, means.values)
+    np.fill_diagonal(D, np.inf)
+    expected = set()
+    for i in range(6):
+        for j in np.argsort(D[i])[:3]:
+            expected.add(frozenset((means.index[i], means.index[int(j)])))
+    got = {frozenset(p) for p in pairs}
+    assert got == expected, (sorted(map(sorted, got)), sorted(map(sorted, expected)))
 
 
 if __name__ == '__main__':
