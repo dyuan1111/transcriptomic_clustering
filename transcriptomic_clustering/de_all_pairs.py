@@ -237,7 +237,9 @@ def _de_one_pair(a, b, cluster_means, present_cluster_means, cl_size, genes, sqr
     'up' compares q1 against q1_thresh / cluster_size and q2 against q2_thresh, 'down' the reverse).
     """
     means_diff = (cluster_means.loc[a] - cluster_means.loc[b]).to_frame()
-    stdev_comb = np.sqrt(np.sum(stdev_unscaled.loc[[a, b]] ** 2))[0]
+    # explicit axis=0: np.sum(DataFrame) is DataFrame.sum(axis=None), which pandas is changing to
+    # a both-axes scalar (FutureWarning); axis=0 pins today's row-reduction behavior.
+    stdev_comb = np.sqrt((stdev_unscaled.loc[[a, b]] ** 2).sum(axis=0))[0]
     df_total = min(df + df_prior, df_pooled)
     t_vals = means_diff / sqrt_sigma / stdev_comb
     p_vals = 2 * stats.t.sf(np.abs(t_vals[0]), df_total)
