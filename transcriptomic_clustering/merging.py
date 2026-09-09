@@ -865,10 +865,12 @@ def _shortlist_pairs_correlation(cluster_means_rd: pd.DataFrame, k: int) -> List
     always 1), ties resolved in column order (`harmonize.R:1082-1084`); self-pairs are then dropped,
     pairs are canonicalized by string min/max and deduped, and ordered by similarity descending.
 
-    Two ways this differs from the pooled path's `get_k_nearest_clusters`, both deliberate there and
-    wrong here: the pooled path uses normalized EUCLIDEAN distance (matching `merge_cl_big`'s
-    Annoy.Euclidean), and it excludes self from the top-k, so k=4 yields 4 real neighbours where R's
-    batch-aware shortlist yields 3.
+    How this differs from the pooled path's `get_k_nearest_clusters`: the METRIC. The pooled path
+    uses normalized EUCLIDEAN distance, matching `merge_cl_big`'s Annoy.Euclidean; this path uses
+    Pearson correlation, matching `merge_cl_multiple`'s `get_cl_sim`. Both propose k-1 real
+    neighbours per cluster -- R's k-window includes the cluster itself in both cases. (Historical
+    note: the pooled path once excluded self and so proposed k, one more than R; that was the
+    shortlist-width half of the pooled gap closed in reports 5/11.)
 
     Returns [(P1, P2, sim)] sorted by sim descending, P1/P2 canonicalized as R names them.
     """
